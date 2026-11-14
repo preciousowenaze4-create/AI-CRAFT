@@ -1,3 +1,5 @@
+import { getSupabaseConfig } from './_supabaseAuth.js';
+
 function cleanEnvKey(raw: string | undefined, placeholders: string[]): string {
   if (typeof raw !== 'string') return '';
   let cleaned = raw.trim();
@@ -49,11 +51,13 @@ function getGeminiApiKey(): string {
 }
 
 export async function GET(): Promise<Response> {
+  const sbConfig = getSupabaseConfig();
   return Response.json(
     {
       ok: true,
       openRouterConfigured: Boolean(getOpenRouterApiKey()),
       geminiConfigured: Boolean(getGeminiApiKey()),
+      supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
       vercelEnv: process.env.VERCEL_ENV || null,
     },
     {

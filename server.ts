@@ -114,10 +114,13 @@ function getSupabaseConfig(): { url: string; anonKey: string; serviceRoleKey: st
     process.env.SUPABASE_ANON_KEY,
     process.env.SUPABASE_PUBLISHABLE_KEY,
     process.env.SUPABASE_PUBLISHABLE_DEFAULT_KEY,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_DEFAULT_KEY,
+    process.env.VITE_SUPABASE_ANON_KEY,
+    process.env.VITE_SUPABASE_PUBLISHABLE_KEY,
     process.env.SUPABASE_PUBLIC_KEY,
     process.env.SUPABASE_KEY,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
-    process.env.VITE_SUPABASE_ANON_KEY,
   ];
   const serviceCandidates = [
     process.env.SUPABASE_SERVICE_ROLE_KEY,
@@ -1898,6 +1901,10 @@ async function startServer() {
             if (window.opener) {
               window.opener.postMessage({ type: 'OAUTH_AUTH_ERROR', message: errMsg }, '*');
               setTimeout(function () { window.close(); }, 1600);
+            } else {
+              setTimeout(function () {
+                window.location.replace('/?auth_error=' + encodeURIComponent(errMsg));
+              }, 700);
             }
             return;
           }
@@ -1934,7 +1941,9 @@ async function startServer() {
                 refresh_token: refreshToken
               })
             });
-            var payload = await res.json();
+            var rawPayload = await res.text();
+            var payload = {};
+            try { payload = rawPayload ? JSON.parse(rawPayload) : {}; } catch (e) {}
             if (!res.ok || !payload.authenticated) {
               throw new Error(payload.error || 'Could not validate sign-in session.');
             }
@@ -1965,15 +1974,24 @@ async function startServer() {
             return;
           }
 
+          var noTokenMsg = 'Authorization code received. Please enable Implicit OAuth flow in Supabase or use Email sign-in.';
           titleEl.textContent = 'Authorization code received';
-          statusEl.textContent =
-            'Please enable Implicit OAuth flow or use Email sign-in in your Supabase project.';
+          statusEl.textContent = noTokenMsg;
+          if (!window.opener) {
+            setTimeout(function () {
+              window.location.replace('/?auth_error=' + encodeURIComponent(noTokenMsg));
+            }, 900);
+          }
         } catch (err) {
           var msg = err && err.message ? err.message : 'Authentication failed.';
           titleEl.textContent = 'Sign-in error';
           statusEl.textContent = msg;
           if (window.opener) {
             window.opener.postMessage({ type: 'OAUTH_AUTH_ERROR', message: msg }, '*');
+          } else {
+            setTimeout(function () {
+              window.location.replace('/?auth_error=' + encodeURIComponent(msg));
+            }, 900);
           }
         }
       })();

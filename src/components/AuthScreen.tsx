@@ -13,6 +13,16 @@ export interface StoredSupabaseSession {
 export const STORAGE_SB_SESSION_KEY = 'aicraft_sb_session_v1';
 export const STORAGE_SB_RECOVERY_KEY = 'aicraft_sb_recovery_v1';
 
+async function safeParseJson<T>(response: Response): Promise<T | null> {
+  const text = await response.text();
+  if (!text) return null;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
 interface AuthScreenProps {
   initialView?: AuthViewMode;
   recoveryTokens?: StoredSupabaseSession | null;
@@ -119,6 +129,25 @@ export function AuthScreen({
   }, [initialView]);
 
   useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const authError = params.get('auth_error');
+      if (authError) {
+        setErrorMessage(authError);
+        params.delete('auth_error');
+        const nextSearch = params.toString();
+        window.history.replaceState(
+          {},
+          '',
+          nextSearch ? `${window.location.pathname}?${nextSearch}` : window.location.pathname
+        );
+      }
+    } catch {
+      // ignore URL search read error
+    }
+  }, []);
+
+  useEffect(() => {
     let cancelled = false;
     const providers: Array<'google' | 'apple' | 'github'> = ['google', 'apple', 'github'];
     void Promise.all(
@@ -126,8 +155,8 @@ export function AuthScreen({
         try {
           const res = await fetch(`/api/auth/oauth/url?provider=${provider}`);
           if (!res.ok) return;
-          const data = (await res.json()) as { url?: string };
-          if (!cancelled && data.url) {
+          const data = await safeParseJson<{ url?: string }>(res);
+          if (!cancelled && data?.url) {
             oauthUrlCacheRef.current[provider] = data.url;
           }
         } catch {
@@ -216,10 +245,58 @@ export function AuthScreen({
     setInfoMessage(null);
     setLoadingProvider(provider);
 
+    const providerLabel =
+      provider === 'google'
+        ? 'Google'
+        : provider === 'apple'
+          ? 'Apple'
+          : 'GitHub';
+
+    const isInIframe = (() => {
+      try {
+        return window.self !== window.top;
+      } catch {
+        return true;
+      }
+    })();
+
     const cachedUrl = oauthUrlCacheRef.current[provider];
 
-    // Open popup synchronously on user gesture (directly with provider URL when cached)
-    // so iOS Safari and Android browsers never block or stall on about:blank.
+    // On direct mobile/Vercel/PWA visits (outside iframe), navigate top window directly
+    // to avoid iOS/Android popup blockers and open native Google/Apple/GitHub login cleanly.
+    if (!isInIframe) {
+      try {
+        let targetUrl = cachedUrl;
+        if (!targetUrl) {
+          const response = await fetch(
+            `/api/auth/oauth/url?provider=${encodeURIComponent(provider)}`
+          );
+          const data = await safeParseJson<{ url?: string; error?: string }>(response);
+          if (!response.ok || !data?.url) {
+            setLoadingProvider(null);
+            setErrorMessage(
+              data?.error ||
+                `Unable to start ${providerLabel} sign-in. Check your backend environment variables.`
+            );
+            return;
+          }
+          targetUrl = data.url;
+          oauthUrlCacheRef.current[provider] = targetUrl;
+        }
+        window.location.assign(targetUrl);
+        return;
+      } catch (err) {
+        setLoadingProvider(null);
+        setErrorMessage(
+          err instanceof Error
+            ? err.message
+            : 'Network error while connecting to Supabase authentication.'
+        );
+        return;
+      }
+    }
+
+    // Inside preview iframe: open popup synchronously on user gesture
     const popup = window.open(
       cachedUrl || 'about:blank',
       'aicraft_oauth_popup',
@@ -237,19 +314,14 @@ export function AuthScreen({
         const response = await fetch(
           `/api/auth/oauth/url?provider=${encodeURIComponent(provider)}`
         );
-        const data = (await response.json()) as { url?: string; error?: string };
+        const data = await safeParseJson<{ url?: string; error?: string }>(response);
 
-        if (!response.ok || !data.url) {
+        if (!response.ok || !data?.url) {
           popup.close();
           setLoadingProvider(null);
-          const providerLabel =
-            provider === 'google'
-              ? 'Google'
-              : provider === 'apple'
-                ? 'Apple'
-                : 'GitHub';
           setErrorMessage(
-            data.error || `Unable to start ${providerLabel} sign-in.`
+            data?.error ||
+              `Unable to start ${providerLabel} sign-in. Check your backend environment variables.`
           );
           return;
         }
@@ -276,13 +348,13 @@ export function AuthScreen({
                         : {}),
                     },
                   });
-                  const meData = (await meRes.json()) as {
+                  const meData = await safeParseJson<{
                     authenticated?: boolean;
                     user?: AuthUser | null;
                     accessToken?: string;
                     refreshToken?: string;
-                  };
-                  if (meData.authenticated && meData.user) {
+                  }>(meRes);
+                  if (meData?.authenticated && meData.user) {
                     setLoadingProvider(null);
                     onAuthenticated(meData.user, {
                       accessToken: meData.accessToken || parsed.accessToken,
@@ -336,16 +408,16 @@ export function AuthScreen({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: cleanEmail, password }),
       });
-      const data = (await response.json()) as {
+      const data = await safeParseJson<{
         authenticated?: boolean;
         user?: AuthUser;
         accessToken?: string;
         refreshToken?: string;
         error?: string;
-      };
+      }>(response);
 
-      if (!response.ok || !data.authenticated || !data.user || !data.accessToken) {
-        setErrorMessage(data.error || 'Invalid email or password.');
+      if (!response.ok || !data?.authenticated || !data.user || !data.accessToken) {
+        setErrorMessage(data?.error || 'Invalid email or password.');
         return;
       }
 
@@ -391,7 +463,7 @@ export function AuthScreen({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: cleanEmail, password }),
       });
-      const data = (await response.json()) as {
+      const data = await safeParseJson<{
         authenticated?: boolean;
         needsEmailConfirmation?: boolean;
         user?: AuthUser;
@@ -399,10 +471,10 @@ export function AuthScreen({
         refreshToken?: string;
         message?: string;
         error?: string;
-      };
+      }>(response);
 
-      if (!response.ok) {
-        setErrorMessage(data.error || 'Could not create your account.');
+      if (!response.ok || !data) {
+        setErrorMessage(data?.error || 'Could not create your account.');
         return;
       }
 
@@ -451,14 +523,14 @@ export function AuthScreen({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: cleanEmail }),
       });
-      const data = (await response.json()) as {
+      const data = await safeParseJson<{
         ok?: boolean;
         message?: string;
         error?: string;
-      };
+      }>(response);
 
-      if (!response.ok) {
-        setErrorMessage(data.error || 'Could not send reset email.');
+      if (!response.ok || !data) {
+        setErrorMessage(data?.error || 'Could not send reset email.');
         return;
       }
 
@@ -510,16 +582,16 @@ export function AuthScreen({
           password: confirmPassword,
         }),
       });
-      const data = (await response.json()) as {
+      const data = await safeParseJson<{
         ok?: boolean;
         user?: AuthUser;
         accessToken?: string;
         refreshToken?: string;
         error?: string;
-      };
+      }>(response);
 
-      if (!response.ok || !data.user || !data.accessToken) {
-        setErrorMessage(data.error || 'Failed to update password.');
+      if (!response.ok || !data?.user || !data.accessToken) {
+        setErrorMessage(data?.error || 'Failed to update password.');
         return;
       }
 
@@ -573,10 +645,10 @@ export function AuthScreen({
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-              className="flex-1 min-h-0 flex flex-col justify-between pb-8 pt-6"
+              className="flex-1 min-h-0 flex flex-col justify-between pb-0 pt-10"
             >
               {/* Centered App Logo & Title */}
-              <div className="flex-1 flex flex-col items-center justify-center pb-6">
+              <div className="flex-1 flex flex-col items-center justify-center pb-4">
                 <img
                   src="/logo-mark.png"
                   alt="AI Craft logo"
@@ -588,7 +660,7 @@ export function AuthScreen({
               </div>
 
               {/* Action Stack: Round Social Row (Google, Apple, GitHub), OR, Email */}
-              <div className="shrink-0 w-full flex flex-col gap-4">
+              <div className="shrink-0 w-full flex flex-col gap-3 translate-y-1">
                 {errorMessage && (
                   <p
                     role="alert"

@@ -266,12 +266,18 @@ export default function App() {
           headers['x-refresh-token'] = storedSession.refreshToken;
         }
         const res = await fetch('/api/auth/me', { headers });
-        const data = (await res.json()) as {
+        const rawText = await res.text();
+        let data: {
           authenticated?: boolean;
           user?: AuthUser | null;
           accessToken?: string;
           refreshToken?: string;
-        };
+        } = {};
+        try {
+          data = rawText ? (JSON.parse(rawText) as typeof data) : {};
+        } catch {
+          data = {};
+        }
         if (cancelled) return;
 
         if (data.authenticated && data.user) {
