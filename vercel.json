@@ -22,6 +22,10 @@
       "destination": "/api/auth?__route=$1"
     },
     {
+      "source": "/api/payments/(.*)",
+      "destination": "/api/payments?__route=$1"
+    },
+    {
       "source": "/api/:match*",
       "destination": "/api/:match*"
     },

@@ -31,6 +31,7 @@ import {
   MODE_THEMES,
   NavTab,
   OpenRouterModel,
+  PaymentTransaction,
   TurnKind,
   UserProfile,
   WorkspaceView,
@@ -53,6 +54,8 @@ const STORAGE_PRO_PLAN_KEY = 'aicraft_pro_plan_v1';
 const STORAGE_PROFILE_KEY = 'aicraft_profile_v1';
 const STORAGE_NOTIFICATIONS_KEY = 'aicraft_notifications_v1';
 const STORAGE_AUTOREAD_KEY = 'aicraft_autoread_v1';
+const STORAGE_TRANSACTIONS_KEY = 'aicraft_transactions_v1';
+const STORAGE_CREDITED_REFS_KEY = 'aicraft_credited_refs_v1';
 
 function isProjectWorking(project: CraftProject | null | undefined): boolean {
   return Boolean(
@@ -233,6 +236,11 @@ export default function App() {
   );
   const [modelsLoading, setModelsLoading] = useState<boolean>(true);
   const [modelsError, setModelsError] = useState<string | null>(null);
+  const [transactions, setTransactions] = useState<PaymentTransaction[]>(() => {
+    const saved = loadStoredJson<PaymentTransaction[]>(STORAGE_TRANSACTIONS_KEY);
+    return Array.isArray(saved) ? saved : [];
+  });
+  const [transactionsLoading, setTransactionsLoading] = useState<boolean>(false);
 
   // Track active network readers per turnId (never globally aborted when switching projects)
   const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
@@ -1286,16 +1294,178 @@ export default function App() {
     setShowProUpgrade(true);
   };
 
-  const handleActivateProPlan = (plan: ProPlanOption) => {
-    setProPlanId(plan.id);
-    setCredits((prev) => prev + plan.creditsToAdd);
+  const applyVerifiedTransaction = useCallback((tx: PaymentTransaction) => {
+    setTransactions((prev) => {
+      const merged = [tx, ...prev.filter((item) => item.reference !== tx.reference)];
+      try {
+        window.localStorage.setItem(STORAGE_TRANSACTIONS_KEY, JSON.stringify(merged));
+      } catch {
+        // ignore storage write error
+      }
+      return merged;
+    });
+
+    if (tx.status !== 'paid') return;
+
+    const alreadyCredited = (() => {
+      const list = loadStoredJson<string[]>(STORAGE_CREDITED_REFS_KEY);
+      return Array.isArray(list) && list.includes(tx.reference);
+    })();
+
+    setProPlanId(tx.planId);
+    try {
+      window.localStorage.setItem(STORAGE_PRO_PLAN_KEY, tx.planId);
+    } catch {
+      // ignore storage write error
+    }
+
+    if (!alreadyCredited) {
+      setCredits((prev) => prev + tx.creditsToAdd);
+      try {
+        const list = loadStoredJson<string[]>(STORAGE_CREDITED_REFS_KEY);
+        const nextList = Array.isArray(list) ? [...list, tx.reference] : [tx.reference];
+        window.localStorage.setItem(STORAGE_CREDITED_REFS_KEY, JSON.stringify(nextList));
+      } catch {
+        // ignore storage write error
+      }
+    }
+
     setShowProUpgrade(false);
     setInlineNotice(
-      `AI Craft ${plan.name} activated · +${plan.creditsToAdd.toLocaleString()} credits added`
+      `AI Craft ${tx.planName} activated · +${tx.creditsToAdd.toLocaleString()} credits added`
     );
-  };
+  }, []);
 
-  const handleRestorePurchase = () => {
+  const refreshTransactions = useCallback(async () => {
+    const email = (authUser?.email || userProfile.email || '').trim();
+    setTransactionsLoading(true);
+    try {
+      const res = await fetch(
+        `/api/payments/transactions?email=${encodeURIComponent(email)}`
+      );
+      const raw = await res.text();
+      let payload: { transactions?: PaymentTransaction[] } = {};
+      try {
+        payload = raw ? (JSON.parse(raw) as typeof payload) : {};
+      } catch {
+        payload = {};
+      }
+      if (res.ok && Array.isArray(payload.transactions)) {
+        setTransactions((prev) => {
+          const map = new Map<string, PaymentTransaction>();
+          for (const item of payload.transactions!) {
+            if (item?.reference) map.set(item.reference, item);
+          }
+          for (const localItem of prev) {
+            if (localItem?.reference && !map.has(localItem.reference)) {
+              map.set(localItem.reference, localItem);
+            }
+          }
+          const merged = Array.from(map.values()).sort(
+            (a, b) => new Date(b.paidAt).getTime() - new Date(a.paidAt).getTime()
+          );
+          try {
+            window.localStorage.setItem(
+              STORAGE_TRANSACTIONS_KEY,
+              JSON.stringify(merged)
+            );
+          } catch {
+            // ignore storage write error
+          }
+          return merged;
+        });
+      }
+    } catch {
+      // keep existing local transactions if offline
+    } finally {
+      setTransactionsLoading(false);
+    }
+  }, [authUser?.email, userProfile.email]);
+
+  useEffect(() => {
+    if (!authUser) return;
+    void refreshTransactions();
+  }, [authUser, refreshTransactions]);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const paymentRef = params.get('payment_ref');
+    const paymentError = params.get('payment_error');
+
+    if (paymentError) {
+      setInlineNotice(paymentError);
+      params.delete('payment_error');
+      const next = params.toString();
+      window.history.replaceState(
+        {},
+        '',
+        next ? `${window.location.pathname}?${next}` : window.location.pathname
+      );
+      return;
+    }
+
+    if (!paymentRef) return;
+
+    params.delete('payment_ref');
+    const next = params.toString();
+    window.history.replaceState(
+      {},
+      '',
+      next ? `${window.location.pathname}?${next}` : window.location.pathname
+    );
+
+    void (async () => {
+      try {
+        const res = await fetch('/api/payments/verify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reference: paymentRef }),
+        });
+        const raw = await res.text();
+        let data: { verified?: boolean; transaction?: PaymentTransaction; error?: string } = {};
+        try {
+          data = raw ? (JSON.parse(raw) as typeof data) : {};
+        } catch {
+          data = {};
+        }
+        if (res.ok && data.verified && data.transaction) {
+          applyVerifiedTransaction(data.transaction);
+        } else {
+          setInlineNotice(data.error || 'Could not confirm payment status.');
+        }
+      } catch {
+        setInlineNotice('Unable to confirm payment right now.');
+      }
+    })();
+  }, [applyVerifiedTransaction]);
+
+  const handleRestorePurchase = async () => {
+    const email = (authUser?.email || userProfile.email || '').trim();
+    try {
+      const res = await fetch(
+        `/api/payments/transactions?email=${encodeURIComponent(email)}`
+      );
+      const raw = await res.text();
+      let data: { transactions?: PaymentTransaction[] } = {};
+      try {
+        data = raw ? (JSON.parse(raw) as typeof data) : {};
+      } catch {
+        data = {};
+      }
+      if (res.ok && Array.isArray(data.transactions)) {
+        const latestPaid = data.transactions.find((t) => t.status === 'paid');
+        if (latestPaid) {
+          applyVerifiedTransaction(latestPaid);
+          return {
+            restored: true,
+            message: `Restored AI Craft ${latestPaid.planName}.`,
+          };
+        }
+      }
+    } catch {
+      // fall back to local saved plan
+    }
+
     const savedPlan = loadSavedString(STORAGE_PRO_PLAN_KEY);
     if (savedPlan) {
       const matched = PRO_PLANS.find((p) => p.id === savedPlan);
@@ -1309,7 +1479,7 @@ export default function App() {
     }
     return {
       restored: false,
-      message: 'No previous subscription found on this device. Choose a plan below.',
+      message: 'No previous subscription found for this account.',
     };
   };
 
@@ -1318,9 +1488,11 @@ export default function App() {
       open={showProUpgrade}
       credits={credits}
       activePlanId={proPlanId}
+      userEmail={authUser?.email || userProfile.email}
+      userId={authUser?.id}
       dynamicColorEnabled={dynamicColorEnabled}
       onClose={() => setShowProUpgrade(false)}
-      onSelectActivatePlan={handleActivateProPlan}
+      onPaymentSuccess={applyVerifiedTransaction}
       onRestorePurchase={handleRestorePurchase}
     />
   );
@@ -1682,6 +1854,9 @@ export default function App() {
                 dynamicColorEnabled={dynamicColorEnabled}
                 notificationsEnabled={notificationsEnabled}
                 autoReadEnabled={autoReadEnabled}
+                transactions={transactions}
+                transactionsLoading={transactionsLoading}
+                onRefreshTransactions={refreshTransactions}
                 onUpdateProfile={setUserProfile}
                 onToggleNotifications={async () => {
                   if (notificationsEnabled) {

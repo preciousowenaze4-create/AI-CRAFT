@@ -6,6 +6,13 @@ import { fileURLToPath } from 'node:url';
 import zlib from 'node:zlib';
 import { createClient, type User as SupabaseUser } from '@supabase/supabase-js';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+import {
+  buildPaymentCallbackHtml,
+  getPaymentSecretKey,
+  initializeCheckoutSession,
+  listCustomerTransactions,
+  verifyCheckoutTransaction,
+} from './api/_paystack.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1998,6 +2005,64 @@ async function startServer() {
     </script>
   </body>
 </html>`);
+  });
+
+  app.get('/api/payments/config', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ configured: Boolean(getPaymentSecretKey()) });
+  });
+
+  app.get(['/api/payments/callback', '/api/payments/callback/'], (_req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(buildPaymentCallbackHtml());
+  });
+
+  app.get('/api/payments/transactions', async (req, res) => {
+    const email = typeof req.query.email === 'string' ? req.query.email : '';
+    const data = await listCustomerTransactions(email);
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(data);
+  });
+
+  app.post('/api/payments/initialize', async (req, res) => {
+    const body = (req.body ?? {}) as {
+      planId?: string;
+      email?: string;
+      userId?: string;
+    };
+    const callbackUrl = `${getAppBaseUrl(req)}/api/payments/callback`;
+    const result = await initializeCheckoutSession({
+      planId: typeof body.planId === 'string' ? body.planId : '',
+      email: typeof body.email === 'string' ? body.email : '',
+      userId: typeof body.userId === 'string' ? body.userId : undefined,
+      callbackUrl,
+    });
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      authorizationUrl: result.authorizationUrl,
+      reference: result.reference,
+    });
+  });
+
+  app.post('/api/payments/verify', async (req, res) => {
+    const body = (req.body ?? {}) as { reference?: string };
+    const reference =
+      typeof body.reference === 'string' ? body.reference.trim() : '';
+    const result = await verifyCheckoutTransaction(reference);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      verified: result.verified,
+      transaction: result.transaction,
+    });
   });
 
   app.get('/api/craft/jobs/:jobId', (req, res) => {

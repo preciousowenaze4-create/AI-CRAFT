@@ -22,6 +22,20 @@ export interface AuthUser {
   provider: string;
 }
 
+export interface PaymentTransaction {
+  id: string;
+  reference: string;
+  planId: 'starter' | 'plus' | 'studio' | 'annual';
+  planName: string;
+  amountNgn: number;
+  amountKobo: number;
+  creditsToAdd: number;
+  status: 'paid' | 'pending' | 'failed';
+  paidAt: string;
+  channel: string;
+  email: string;
+}
+
 export interface OpenRouterModel {
   id: string;
   name: string;

@@ -1,3 +1,4 @@
+import { getPaymentSecretKey } from './_paystack.js';
 import { getSupabaseConfig } from './_supabaseAuth.js';
 
 function cleanEnvKey(raw: string | undefined, placeholders: string[]): string {
@@ -58,6 +59,7 @@ export async function GET(): Promise<Response> {
       openRouterConfigured: Boolean(getOpenRouterApiKey()),
       geminiConfigured: Boolean(getGeminiApiKey()),
       supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
+      paymentsConfigured: Boolean(getPaymentSecretKey()),
       vercelEnv: process.env.VERCEL_ENV || null,
     },
     {
