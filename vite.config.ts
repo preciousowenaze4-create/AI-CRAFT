@@ -26,7 +26,7 @@ export default defineConfig(() => {
           description:
             'AI Craft — Build iOS, Android, and Full-Stack Web Apps instantly with no code.',
           theme_color: '#ffffff',
-          background_color: '#000000',
+          background_color: '#FEF7E0',
           display: 'standalone',
           orientation: 'portrait',
           start_url: '/',

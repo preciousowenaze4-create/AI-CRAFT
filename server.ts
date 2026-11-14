@@ -113,6 +113,8 @@ function getSupabaseConfig(): { url: string; anonKey: string; serviceRoleKey: st
   const anonCandidates = [
     process.env.SUPABASE_ANON_KEY,
     process.env.SUPABASE_PUBLISHABLE_KEY,
+    process.env.SUPABASE_PUBLISHABLE_DEFAULT_KEY,
+    process.env.SUPABASE_PUBLIC_KEY,
     process.env.SUPABASE_KEY,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
     process.env.VITE_SUPABASE_ANON_KEY,
@@ -120,13 +122,18 @@ function getSupabaseConfig(): { url: string; anonKey: string; serviceRoleKey: st
   const serviceCandidates = [
     process.env.SUPABASE_SERVICE_ROLE_KEY,
     process.env.SUPABASE_SERVICE_KEY,
+    process.env.SUPABASE_SECRET_KEY,
   ];
 
   let url = '';
   for (const raw of urlCandidates) {
     const cleaned = cleanEnvKey(raw, ['MY_SUPABASE_URL']);
     if (cleaned && /^https?:\/\//i.test(cleaned)) {
-      url = cleaned.replace(/\/+$/, '');
+      try {
+        url = new URL(cleaned).origin;
+      } catch {
+        url = cleaned.replace(/\/+(rest|auth|storage|realtime)\/v\d+.*$/i, '').replace(/\/+$/, '');
+      }
       break;
     }
   }
@@ -1510,6 +1517,13 @@ async function startServer() {
       });
 
       if (error) {
+        if (/already registered|already exists|duplicate/i.test(error.message)) {
+          res.status(409).json({
+            error:
+              'This email already has an account (from Google, GitHub, Apple, or Email). Please sign in instead.',
+          });
+          return;
+        }
         res.status(error.status || 400).json({ error: error.message });
         return;
       }
@@ -1520,7 +1534,8 @@ async function startServer() {
         data.user.identities.length === 0
       ) {
         res.status(409).json({
-          error: 'An account with this email already exists. Try signing in instead.',
+          error:
+            'This email already has an account (from Google, GitHub, Apple, or Email). Please sign in instead.',
         });
         return;
       }

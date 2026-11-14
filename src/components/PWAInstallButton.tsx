@@ -53,7 +53,7 @@ export function PWAInstallButton({
   return (
     <div className="rounded-[16px] border border-black/[0.08] bg-white p-2.5 shadow-[0_4px_16px_rgba(15,15,30,0.03)] flex flex-col gap-2 shrink-0">
       <div className="flex items-center gap-2.5">
-        <div className="w-9 h-9 rounded-[10px] bg-black overflow-hidden shrink-0 ring-1 ring-black/10 shadow-xs flex items-center justify-center">
+        <div className="w-9 h-9 rounded-[10px] bg-[#FEF7E0] overflow-hidden shrink-0 ring-1 ring-black/10 shadow-xs flex items-center justify-center">
           <img
             src="/pwa-192x192.png"
             alt="AI Craft home screen icon"

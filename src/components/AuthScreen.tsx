@@ -112,10 +112,33 @@ export function AuthScreen({
   const [infoMessage, setInfoMessage] = useState<string | null>(null);
 
   const popupPollRef = useRef<number | null>(null);
+  const oauthUrlCacheRef = useRef<Partial<Record<'google' | 'apple' | 'github', string>>>({});
 
   useEffect(() => {
     setView(initialView);
   }, [initialView]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const providers: Array<'google' | 'apple' | 'github'> = ['google', 'apple', 'github'];
+    void Promise.all(
+      providers.map(async (provider) => {
+        try {
+          const res = await fetch(`/api/auth/oauth/url?provider=${provider}`);
+          if (!res.ok) return;
+          const data = (await res.json()) as { url?: string };
+          if (!cancelled && data.url) {
+            oauthUrlCacheRef.current[provider] = data.url;
+          }
+        } catch {
+          // ignore prefetch error; handleOAuthClick will fetch on demand
+        }
+      })
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const stopPopupPolling = () => {
     if (popupPollRef.current !== null) {
@@ -193,10 +216,12 @@ export function AuthScreen({
     setInfoMessage(null);
     setLoadingProvider(provider);
 
-    // Open blank popup synchronously on user gesture to avoid mobile Safari popup blockers,
-    // then navigate it to the Supabase OAuth provider URL returned by our backend.
+    const cachedUrl = oauthUrlCacheRef.current[provider];
+
+    // Open popup synchronously on user gesture (directly with provider URL when cached)
+    // so iOS Safari and Android browsers never block or stall on about:blank.
     const popup = window.open(
-      'about:blank',
+      cachedUrl || 'about:blank',
       'aicraft_oauth_popup',
       'width=520,height=680'
     );
@@ -208,27 +233,30 @@ export function AuthScreen({
     }
 
     try {
-      const response = await fetch(
-        `/api/auth/oauth/url?provider=${encodeURIComponent(provider)}`
-      );
-      const data = (await response.json()) as { url?: string; error?: string };
-
-      if (!response.ok || !data.url) {
-        popup.close();
-        setLoadingProvider(null);
-        const providerLabel =
-          provider === 'google'
-            ? 'Google'
-            : provider === 'apple'
-              ? 'Apple'
-              : 'GitHub';
-        setErrorMessage(
-          data.error || `Unable to start ${providerLabel} sign-in.`
+      if (!cachedUrl) {
+        const response = await fetch(
+          `/api/auth/oauth/url?provider=${encodeURIComponent(provider)}`
         );
-        return;
-      }
+        const data = (await response.json()) as { url?: string; error?: string };
 
-      popup.location.href = data.url;
+        if (!response.ok || !data.url) {
+          popup.close();
+          setLoadingProvider(null);
+          const providerLabel =
+            provider === 'google'
+              ? 'Google'
+              : provider === 'apple'
+                ? 'Apple'
+                : 'GitHub';
+          setErrorMessage(
+            data.error || `Unable to start ${providerLabel} sign-in.`
+          );
+          return;
+        }
+
+        oauthUrlCacheRef.current[provider] = data.url;
+        popup.location.href = data.url;
+      }
 
       stopPopupPolling();
       popupPollRef.current = window.setInterval(() => {
