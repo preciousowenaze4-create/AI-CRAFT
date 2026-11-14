@@ -1,0 +1,1562 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
+import { ArrowRight, ChevronRight, Loader2, Plus } from 'lucide-react';
+import { BottomNav } from './components/BottomNav';
+import { BuilderWorkspace } from './components/BuilderWorkspace';
+import { Head3DOverlay } from './components/Head3DOverlay';
+import { HeroStage } from './components/HeroStage';
+import { ModeSwitcher } from './components/ModeSwitcher';
+import { OfflineIndicator } from './components/PWAInstallButton';
+import { ProfileSection } from './components/ProfileSection';
+import {
+  PRO_PLANS,
+  ProPlanOption,
+  ProUpgradeModal,
+} from './components/ProUpgradeModal';
+import { PromptComposer } from './components/PromptComposer';
+import { TopBar } from './components/TopBar';
+import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
+import {
+  BuildMode,
+  BuilderTurn,
+  ComposerOptions,
+  MODE_THEMES,
+  NavTab,
+  OpenRouterModel,
+  TurnKind,
+  UserProfile,
+  WorkspaceView,
+} from './types/craft';
+
+interface CraftProject {
+  id: string;
+  title: string;
+  mode: BuildMode;
+  createdAt: string;
+  turns: BuilderTurn[];
+}
+
+const STORAGE_PROJECTS_KEY = 'aicraft_projects_v1';
+const STORAGE_VIEWS_KEY = 'aicraft_project_views_v1';
+const STORAGE_PUBLISHED_KEY = 'aicraft_published_v1';
+const STORAGE_MODEL_KEY = 'aicraft_selected_model_v1';
+const STORAGE_CREDITS_KEY = 'aicraft_credits_v1';
+const STORAGE_PRO_PLAN_KEY = 'aicraft_pro_plan_v1';
+const STORAGE_PROFILE_KEY = 'aicraft_profile_v1';
+const STORAGE_NOTIFICATIONS_KEY = 'aicraft_notifications_v1';
+const STORAGE_AUTOREAD_KEY = 'aicraft_autoread_v1';
+
+function isProjectWorking(project: CraftProject | null | undefined): boolean {
+  return Boolean(
+    project?.turns.some(
+      (t) => t.phase === 'understanding' || t.phase === 'building'
+    )
+  );
+}
+
+function loadSavedProjects(): CraftProject[] {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_PROJECTS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as CraftProject[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadSavedRecord<T>(key: string): Record<string, T> {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, T>) : {};
+  } catch {
+    return {};
+  }
+}
+
+function loadSavedString(key: string): string {
+  try {
+    return window.localStorage.getItem(key) || '';
+  } catch {
+    return '';
+  }
+}
+
+function saveProjectsSafely(projects: CraftProject[]) {
+  try {
+    window.localStorage.setItem(STORAGE_PROJECTS_KEY, JSON.stringify(projects));
+  } catch {
+    // Trim heavy inline base64 screenshots if storage quota is tight
+    try {
+      const compact = projects.slice(0, 20).map((proj, idx) => ({
+        ...proj,
+        turns: proj.turns.map((turn) => ({
+          ...turn,
+          attachmentDataUrl: idx === 0 ? turn.attachmentDataUrl : null,
+        })),
+      }));
+      window.localStorage.setItem(STORAGE_PROJECTS_KEY, JSON.stringify(compact));
+    } catch {
+      // Ignore storage quota failure gracefully
+    }
+  }
+}
+
+function deriveProjectTitle(promptText: string, mode: BuildMode): string {
+  const cleaned = promptText
+    .replace(/^(build|create|make|design)\s+(me\s+)?(an?|the)\s+/i, '')
+    .trim();
+  const words = cleaned.split(/\s+/).filter(Boolean).slice(0, 3);
+  if (words.length === 0) {
+    return mode === 'mobile' ? 'AICraft Mobile' : 'AICraft Web';
+  }
+  const title = words
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+  return title.length > 24 ? `${title.slice(0, 24)}…` : title;
+}
+
+function loadSavedCredits(): number {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_CREDITS_KEY);
+    if (!raw) return 7;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 7;
+  } catch {
+    return 7;
+  }
+}
+
+function loadSavedProfile(): UserProfile {
+  try {
+    const raw = window.localStorage.getItem(STORAGE_PROFILE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<UserProfile>;
+      if (parsed && typeof parsed === 'object') {
+        return {
+          name:
+            typeof parsed.name === 'string' && parsed.name.trim()
+              ? parsed.name.trim()
+              : 'Precious Owenaze',
+          email:
+            typeof parsed.email === 'string' && parsed.email.trim()
+              ? parsed.email.trim()
+              : 'preciousowenaze4@gmail.com',
+          avatarDataUrl:
+            typeof parsed.avatarDataUrl === 'string' ? parsed.avatarDataUrl : null,
+        };
+      }
+    }
+  } catch {
+    // ignore storage read error
+  }
+  return {
+    name: 'Precious Owenaze',
+    email: 'preciousowenaze4@gmail.com',
+    avatarDataUrl: null,
+  };
+}
+
+function loadSavedBoolean(key: string, defaultValue: boolean): boolean {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === 'true') return true;
+    if (raw === 'false') return false;
+  } catch {
+    // ignore storage read error
+  }
+  return defaultValue;
+}
+
+export default function App() {
+  const [mode, setMode] = useState<BuildMode>('mobile');
+  const [activeTab, setActiveTab] = useState<NavTab>('create');
+  const [viewMode, setViewMode] = useState<'home' | 'builder'>('home');
+  const [prompt, setPrompt] = useState('');
+  const [credits, setCredits] = useState<number>(() => loadSavedCredits());
+  const [proPlanId, setProPlanId] = useState<string | null>(() => {
+    const saved = loadSavedString(STORAGE_PRO_PLAN_KEY);
+    return saved || null;
+  });
+  const [userProfile, setUserProfile] = useState<UserProfile>(() => loadSavedProfile());
+  const [notificationsEnabled, setNotificationsEnabled] = useState<boolean>(() =>
+    loadSavedBoolean(STORAGE_NOTIFICATIONS_KEY, false)
+  );
+  const [autoReadEnabled, setAutoReadEnabled] = useState<boolean>(() =>
+    loadSavedBoolean(STORAGE_AUTOREAD_KEY, true)
+  );
+  const [showProUpgrade, setShowProUpgrade] = useState(false);
+  const [dynamicColorEnabled, setDynamicColorEnabled] = useState(true);
+  const [projects, setProjects] = useState<CraftProject[]>(() => loadSavedProjects());
+  const [projectViews, setProjectViews] = useState<Record<string, WorkspaceView>>(() =>
+    loadSavedRecord<WorkspaceView>(STORAGE_VIEWS_KEY)
+  );
+  const [publishedProjects, setPublishedProjects] = useState<Record<string, boolean>>(() =>
+    loadSavedRecord<boolean>(STORAGE_PUBLISHED_KEY)
+  );
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [inlineNotice, setInlineNotice] = useState<string | null>(null);
+  const [models, setModels] = useState<OpenRouterModel[]>([]);
+  const [selectedModel, setSelectedModel] = useState<string>(() =>
+    loadSavedString(STORAGE_MODEL_KEY)
+  );
+  const [modelsLoading, setModelsLoading] = useState<boolean>(true);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+
+  // Track active network readers per turnId (never globally aborted when switching projects)
+  const activeConnectionsRef = useRef<Map<string, AbortController>>(new Map());
+  const retriedTurnsRef = useRef<Set<string>>(new Set());
+  const projectsRef = useRef<CraftProject[]>(projects);
+  projectsRef.current = projects;
+
+  const persistTimerRef = useRef<number | null>(null);
+
+  const theme = MODE_THEMES[mode];
+  const energyLevel = dynamicColorEnabled
+    ? Math.min(1, prompt.trim().length / 40)
+    : 0;
+
+  const activeProject =
+    projects.find((p) => p.id === activeProjectId) ?? null;
+  const activeProjectIsStreaming = isProjectWorking(activeProject);
+
+  // Real-time dynamic mobile browser theme-color update
+  useEffect(() => {
+    const existingMeta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+
+    if (showProUpgrade) {
+      const meta = existingMeta ?? document.createElement('meta');
+      meta.name = 'theme-color';
+      meta.content = '#0D47EE';
+      if (!existingMeta) document.head.appendChild(meta);
+      return;
+    }
+
+    if (viewMode === 'builder' && activeProject) {
+      const currentView = projectViews[activeProject.id] ?? 'chat';
+      const hasBuiltApp = activeProject.turns.some((t) => Boolean(t.previewHtml));
+      if (currentView === 'preview' && !hasBuiltApp) {
+        // LivingBotanicalWallpaper dynamically syncs theme-color to each slide's top edge
+        return;
+      }
+      const meta = existingMeta ?? document.createElement('meta');
+      meta.name = 'theme-color';
+      meta.content = '#FFFFFF';
+      if (!existingMeta) document.head.appendChild(meta);
+    } else {
+      const meta = existingMeta ?? document.createElement('meta');
+      meta.name = 'theme-color';
+      meta.content = dynamicColorEnabled ? theme.themeColor : '#FFFFFF';
+      if (!existingMeta) document.head.appendChild(meta);
+    }
+  }, [theme.themeColor, dynamicColorEnabled, viewMode, activeProject, projectViews, showProUpgrade]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_CREDITS_KEY, String(credits));
+    } catch {
+      // ignore storage failure
+    }
+  }, [credits]);
+
+  useEffect(() => {
+    try {
+      if (proPlanId) {
+        window.localStorage.setItem(STORAGE_PRO_PLAN_KEY, proPlanId);
+      }
+    } catch {
+      // ignore storage failure
+    }
+  }, [proPlanId]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_PROFILE_KEY, JSON.stringify(userProfile));
+    } catch {
+      // ignore storage failure
+    }
+  }, [userProfile]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        STORAGE_NOTIFICATIONS_KEY,
+        String(notificationsEnabled)
+      );
+    } catch {
+      // ignore storage failure
+    }
+  }, [notificationsEnabled]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_AUTOREAD_KEY, String(autoReadEnabled));
+    } catch {
+      // ignore storage failure
+    }
+  }, [autoReadEnabled]);
+
+  useEffect(() => {
+    if (!inlineNotice) return;
+    const timer = window.setTimeout(() => setInlineNotice(null), 2800);
+    return () => window.clearTimeout(timer);
+  }, [inlineNotice]);
+
+  // Debounced lag-free localStorage persistence
+  useEffect(() => {
+    if (persistTimerRef.current !== null) {
+      window.clearTimeout(persistTimerRef.current);
+    }
+    const delay = projects.some((p) => isProjectWorking(p)) ? 900 : 120;
+    persistTimerRef.current = window.setTimeout(() => {
+      persistTimerRef.current = null;
+      saveProjectsSafely(projects);
+    }, delay);
+  }, [projects]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_VIEWS_KEY, JSON.stringify(projectViews));
+    } catch {
+      // ignore storage failure
+    }
+  }, [projectViews]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(STORAGE_PUBLISHED_KEY, JSON.stringify(publishedProjects));
+    } catch {
+      // ignore storage failure
+    }
+  }, [publishedProjects]);
+
+  useEffect(() => {
+    if (!selectedModel) return;
+    try {
+      window.localStorage.setItem(STORAGE_MODEL_KEY, selectedModel);
+    } catch {
+      // ignore storage failure
+    }
+  }, [selectedModel]);
+
+  const loadModels = async (refresh = false) => {
+    setModelsLoading(true);
+    setModelsError(null);
+    try {
+      const url = refresh ? '/api/models?refresh=1' : '/api/models';
+      const response = await fetch(url);
+      const contentType = response.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        throw new Error('Backend /api/models endpoint returned non-JSON response.');
+      }
+      const data = (await response.json()) as {
+        models?: OpenRouterModel[];
+        error?: string;
+      };
+      const fetched = Array.isArray(data?.models) ? data.models : [];
+      if (fetched.length > 0) {
+        setModels(fetched);
+        setSelectedModel((prev) =>
+          prev && fetched.some((m) => m.id === prev) ? prev : fetched[0].id
+        );
+      } else if (!response.ok || data?.error) {
+        setModelsError(data?.error || 'Unable to load OpenRouter models.');
+      }
+    } catch (err) {
+      setModelsError(
+        err instanceof Error ? err.message : 'Unable to load OpenRouter models.'
+      );
+    } finally {
+      setModelsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadModels(false);
+  }, []);
+
+  const updateTurn = useCallback(
+    (
+      projectId: string,
+      turnId: string,
+      updater: (turn: BuilderTurn) => BuilderTurn
+    ) => {
+      setProjects((prev) =>
+        prev.map((proj) => {
+          if (proj.id !== projectId) return proj;
+          return {
+            ...proj,
+            turns: proj.turns.map((t) => (t.id === turnId ? updater(t) : t)),
+          };
+        })
+      );
+    },
+    []
+  );
+
+  const consumeSseStream = useCallback(
+    async (
+      projectId: string,
+      turnId: string,
+      fallbackStartedAt: number,
+      response: Response,
+      onJobAssigned?: (jobId: string) => void
+    ): Promise<{ sawTerminalEvent: boolean; latestJobId?: string }> => {
+      if (!response.body) {
+        throw new Error('Failed to connect to AI Craft.');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let sawTerminalEvent = false;
+      let latestJobId: string | undefined;
+      let startedAt = fallbackStartedAt;
+
+      // Batch rapid token deltas (~90ms) so concurrent background builds cause zero UI lag
+      let pendingDelta = '';
+      let pendingBytes: number | null = null;
+      let flushTimer: number | null = null;
+
+      const flushBuffered = () => {
+        if (flushTimer !== null) {
+          window.clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        const deltaChunk = pendingDelta;
+        const bytesChunk = pendingBytes;
+        pendingDelta = '';
+        pendingBytes = null;
+        if (!deltaChunk && bytesChunk === null) return;
+
+        updateTurn(projectId, turnId, (t) => ({
+          ...t,
+          aiText: deltaChunk ? t.aiText + deltaChunk : t.aiText,
+          bytesBuilt: bytesChunk !== null ? bytesChunk : t.bytesBuilt,
+        }));
+      };
+
+      const scheduleBufferedFlush = () => {
+        if (flushTimer !== null) return;
+        flushTimer = window.setTimeout(flushBuffered, 90);
+      };
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split('\n\n');
+          buffer = events.pop() ?? '';
+
+          for (const rawEvent of events) {
+            const line = rawEvent
+              .split('\n')
+              .find((l) => l.startsWith('data: '));
+            if (!line) continue;
+
+            try {
+              const evt = JSON.parse(line.slice(6)) as {
+                type: string;
+                jobId?: string;
+                startedAt?: number;
+                status?: 'running' | 'complete' | 'error';
+                kind?: TurnKind;
+                modelId?: string;
+                modelUsed?: string;
+                modelName?: string;
+                provider?: string;
+                phase?: 'understanding' | 'building' | 'complete' | 'error';
+                label?: string;
+                phaseLabel?: string;
+                action?: string;
+                activeAction?: string;
+                path?: string;
+                activeFile?: string;
+                allFiles?: string[];
+                files?: string[];
+                allSteps?: string[];
+                planSteps?: string[];
+                suggestions?: string[];
+                bytesBuilt?: number;
+                text?: string;
+                aiText?: string;
+                fullText?: string;
+                previewHtml?: string;
+                message?: string;
+                errorMessage?: string;
+                thoughtSeconds?: number;
+              };
+
+              if (evt.type === 'job' && evt.jobId) {
+                latestJobId = evt.jobId;
+                if (typeof evt.startedAt === 'number') {
+                  startedAt = evt.startedAt;
+                }
+                onJobAssigned?.(evt.jobId);
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  jobId: evt.jobId,
+                  startedAt: typeof evt.startedAt === 'number' ? evt.startedAt : t.startedAt,
+                }));
+              } else if (evt.type === 'snapshot') {
+                flushBuffered();
+                if (typeof evt.startedAt === 'number') {
+                  startedAt = evt.startedAt;
+                }
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  jobId: evt.jobId ?? t.jobId,
+                  startedAt: typeof evt.startedAt === 'number' ? evt.startedAt : t.startedAt,
+                  kind: evt.kind ?? t.kind,
+                  phase: evt.phase ?? t.phase,
+                  phaseLabel: evt.phaseLabel ?? t.phaseLabel,
+                  thoughtSeconds:
+                    typeof evt.thoughtSeconds === 'number'
+                      ? evt.thoughtSeconds
+                      : t.thoughtSeconds,
+                  aiText: typeof evt.aiText === 'string' ? evt.aiText : t.aiText,
+                  previewHtml: evt.previewHtml || t.previewHtml,
+                  files: Array.isArray(evt.files) ? evt.files : t.files,
+                  planSteps: Array.isArray(evt.planSteps) ? evt.planSteps : t.planSteps,
+                  suggestions: Array.isArray(evt.suggestions)
+                    ? evt.suggestions
+                    : t.suggestions,
+                  activeAction: evt.activeAction ?? t.activeAction,
+                  activeFile: evt.activeFile ?? t.activeFile,
+                  bytesBuilt:
+                    typeof evt.bytesBuilt === 'number' ? evt.bytesBuilt : t.bytesBuilt,
+                  modelId: evt.modelId ?? t.modelId,
+                  modelName: evt.modelName ?? t.modelName,
+                  modelProvider: evt.provider ?? t.modelProvider,
+                  errorMessage: evt.errorMessage ?? t.errorMessage,
+                }));
+              } else if (evt.type === 'meta') {
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  kind: evt.kind ?? t.kind,
+                  modelId: evt.modelId ?? t.modelId,
+                  modelName: evt.modelName ?? t.modelName,
+                  modelProvider: evt.provider ?? t.modelProvider,
+                }));
+              } else if (
+                evt.type === 'phase' &&
+                (evt.phase === 'understanding' || evt.phase === 'building') &&
+                evt.label
+              ) {
+                flushBuffered();
+                const nextPhase = evt.phase;
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  kind:
+                    evt.kind ??
+                    (nextPhase === 'building' ? 'build' : t.kind),
+                  phase: nextPhase,
+                  phaseLabel: evt.label!,
+                }));
+              } else if (evt.type === 'plan' && Array.isArray(evt.allSteps)) {
+                flushBuffered();
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  planSteps: evt.allSteps,
+                }));
+              } else if (evt.type === 'file' && evt.path) {
+                flushBuffered();
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  kind: 'build',
+                  phase: t.phase === 'understanding' ? 'building' : t.phase,
+                  activeAction: evt.action ?? t.activeAction,
+                  activeFile: evt.path!,
+                  files: evt.allFiles ?? t.files,
+                  bytesBuilt:
+                    typeof evt.bytesBuilt === 'number'
+                      ? evt.bytesBuilt
+                      : t.bytesBuilt,
+                }));
+              } else if (evt.type === 'progress') {
+                if (typeof evt.bytesBuilt === 'number') {
+                  pendingBytes = evt.bytesBuilt;
+                  scheduleBufferedFlush();
+                }
+              } else if (evt.type === 'reset') {
+                pendingDelta = '';
+                pendingBytes = null;
+                if (flushTimer !== null) {
+                  window.clearTimeout(flushTimer);
+                  flushTimer = null;
+                }
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  kind: 'chat',
+                  phase: 'understanding',
+                  phaseLabel: 'Thinking...',
+                  aiText: '',
+                  files: [],
+                  planSteps: [],
+                  suggestions: [],
+                  activeFile: '',
+                  activeAction: 'Thinking',
+                  bytesBuilt: 0,
+                }));
+              } else if (evt.type === 'delta' && evt.text) {
+                pendingDelta += evt.text;
+                scheduleBufferedFlush();
+              } else if (evt.type === 'done') {
+                sawTerminalEvent = true;
+                flushBuffered();
+                const finalSeconds = Math.max(
+                  1,
+                  Math.round(
+                    (Date.now() - (typeof evt.startedAt === 'number' ? evt.startedAt : startedAt)) /
+                      1000
+                  )
+                );
+                updateTurn(projectId, turnId, (t) => {
+                  const resolvedFiles = evt.allFiles ?? t.files;
+                  return {
+                    ...t,
+                    kind: evt.kind ?? t.kind,
+                    phase: 'complete',
+                    phaseLabel:
+                      (evt.kind ?? t.kind) === 'chat'
+                        ? 'Answered'
+                        : 'Build complete',
+                    thoughtSeconds: finalSeconds,
+                    aiText:
+                      typeof evt.fullText === 'string' && evt.fullText.trim()
+                        ? evt.fullText
+                        : t.aiText,
+                    previewHtml: evt.previewHtml || t.previewHtml,
+                    files: resolvedFiles,
+                    suggestions: Array.isArray(evt.suggestions)
+                      ? evt.suggestions
+                      : t.suggestions,
+                    activeAction:
+                      resolvedFiles.length > 0 ? 'Built' : t.activeAction,
+                    activeFile: resolvedFiles[0] ?? t.activeFile,
+                    bytesBuilt:
+                      typeof evt.bytesBuilt === 'number'
+                        ? evt.bytesBuilt
+                        : t.bytesBuilt,
+                    modelId: evt.modelUsed ?? t.modelId,
+                    modelName: evt.modelName ?? t.modelName,
+                    modelProvider: evt.provider ?? t.modelProvider,
+                  };
+                });
+                if (
+                  notificationsEnabled &&
+                  document.visibilityState === 'hidden' &&
+                  typeof Notification !== 'undefined' &&
+                  Notification.permission === 'granted'
+                ) {
+                  try {
+                    const matchedProj = projectsRef.current.find(
+                      (p) => p.id === projectId
+                    );
+                    new Notification(matchedProj?.title || 'AI Craft', {
+                      body:
+                        (evt.kind ?? 'chat') === 'build'
+                          ? 'Your app build is finished and ready to preview.'
+                          : 'AI Craft finished replying to your message.',
+                    });
+                  } catch {
+                    // ignore notification error in unsupported contexts
+                  }
+                }
+              } else if (evt.type === 'error') {
+                sawTerminalEvent = true;
+                flushBuffered();
+                updateTurn(projectId, turnId, (t) => ({
+                  ...t,
+                  phase: 'error',
+                  phaseLabel: 'Error',
+                  errorMessage: evt.message ?? 'AI Craft encountered an error.',
+                }));
+              }
+            } catch {
+              // ignore malformed chunk
+            }
+          }
+        }
+      } finally {
+        flushBuffered();
+      }
+
+      return { sawTerminalEvent, latestJobId };
+    },
+    [updateTurn]
+  );
+
+  const runBuilderStream = useCallback(
+    async (
+      projectId: string,
+      turnId: string,
+      message: string,
+      targetMode: BuildMode,
+      modelToUse: string | undefined,
+      history: Array<{ role: string; text: string }>,
+      options: ComposerOptions,
+      previousHtml = '',
+      startedAt = Date.now()
+    ) => {
+      if (activeConnectionsRef.current.has(turnId)) return;
+
+      const controller = new AbortController();
+      activeConnectionsRef.current.set(turnId, controller);
+
+      let knownJobId: string | undefined;
+
+      try {
+        const clientTimeZone =
+          Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        const clientTime = new Date().toLocaleString();
+
+        const response = await fetch('/api/craft/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message,
+            mode: targetMode,
+            model: modelToUse || undefined,
+            clientTime,
+            clientTimeZone,
+            previousHtml,
+            history,
+            options,
+          }),
+          signal: controller.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          let errorText = 'Failed to connect to AI Craft.';
+          try {
+            const errJson = (await response.json()) as { error?: string };
+            if (errJson.error) errorText = errJson.error;
+          } catch {
+            // ignore parse error
+          }
+          throw new Error(errorText);
+        }
+
+        const result = await consumeSseStream(
+          projectId,
+          turnId,
+          startedAt,
+          response,
+          (jid) => {
+            knownJobId = jid;
+          }
+        );
+
+        activeConnectionsRef.current.delete(turnId);
+
+        if (!result.sawTerminalEvent) {
+          const reconnectJobId = result.latestJobId || knownJobId;
+          if (reconnectJobId && document.visibilityState === 'visible') {
+            void resumeJobStreamRef.current?.(projectId, turnId, reconnectJobId);
+          } else if (!reconnectJobId) {
+            updateTurn(projectId, turnId, (t) =>
+              t.phase === 'complete' || t.phase === 'error'
+                ? t
+                : {
+                    ...t,
+                    phase: 'error',
+                    phaseLabel: 'Paused',
+                    errorMessage: 'Stream connection ended early. Send a message to continue.',
+                  }
+            );
+          }
+        }
+      } catch (err) {
+        activeConnectionsRef.current.delete(turnId);
+        if ((err as Error).name !== 'AbortError') {
+          // If the user left the app on mobile Safari and the socket dropped, reconnect to the backend job instead of failing
+          if (knownJobId) {
+            if (document.visibilityState === 'visible') {
+              window.setTimeout(() => {
+                void resumeJobStreamRef.current?.(projectId, turnId, knownJobId!);
+              }, 600);
+            }
+            return;
+          }
+
+          const msg =
+            err instanceof Error
+              ? err.message
+              : 'Unable to reach AI Craft engine right now.';
+          updateTurn(projectId, turnId, (t) => ({
+            ...t,
+            phase: 'error',
+            phaseLabel: 'Error',
+            errorMessage: msg,
+          }));
+        }
+      }
+    },
+    [consumeSseStream, updateTurn]
+  );
+
+  const resumeJobStream = useCallback(
+    async (projectId: string, turnId: string, jobId?: string) => {
+      if (activeConnectionsRef.current.has(turnId)) return;
+
+      const project = projectsRef.current.find((p) => p.id === projectId);
+      const turn = project?.turns.find((t) => t.id === turnId);
+      if (!project || !turn) return;
+      if (turn.phase === 'complete' || turn.phase === 'error') return;
+
+      const targetJobId = jobId || turn.jobId;
+      if (!targetJobId) {
+        if (!retriedTurnsRef.current.has(turnId)) {
+          retriedTurnsRef.current.add(turnId);
+          const idx = project.turns.findIndex((t) => t.id === turnId);
+          const priorTurns = idx > 0 ? project.turns.slice(0, idx) : [];
+          const history = priorTurns.flatMap((t) => [
+            { role: 'user', text: t.userMessage },
+            ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
+          ]);
+          const previousHtml =
+            [...priorTurns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+          void runBuilderStream(
+            project.id,
+            turn.id,
+            turn.userMessage,
+            project.mode,
+            turn.modelId,
+            history,
+            {
+              reactEnabled: project.mode === 'web',
+              backendEnabled: false,
+              webSearchEnabled: true,
+              attachmentName: turn.attachmentName,
+              attachmentDataUrl: turn.attachmentDataUrl ?? null,
+            },
+            previousHtml,
+            turn.startedAt ?? Date.now()
+          );
+        }
+        return;
+      }
+
+      const controller = new AbortController();
+      activeConnectionsRef.current.set(turnId, controller);
+
+      try {
+        const response = await fetch(
+          `/api/craft/jobs/${encodeURIComponent(targetJobId)}?stream=1`,
+          { signal: controller.signal }
+        );
+
+        if (response.status === 404) {
+          activeConnectionsRef.current.delete(turnId);
+          // Serverless cold start or expired job: automatically re-run once seamlessly
+          if (!retriedTurnsRef.current.has(turnId)) {
+            retriedTurnsRef.current.add(turnId);
+            const idx = project.turns.findIndex((t) => t.id === turnId);
+            const priorTurns = idx > 0 ? project.turns.slice(0, idx) : [];
+            const history = priorTurns.flatMap((t) => [
+              { role: 'user', text: t.userMessage },
+              ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
+            ]);
+            const previousHtml =
+              [...priorTurns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+            void runBuilderStream(
+              project.id,
+              turn.id,
+              turn.userMessage,
+              project.mode,
+              turn.modelId,
+              history,
+              {
+                reactEnabled: project.mode === 'web',
+                backendEnabled: false,
+                webSearchEnabled: true,
+                attachmentName: turn.attachmentName,
+                attachmentDataUrl: turn.attachmentDataUrl ?? null,
+              },
+              previousHtml,
+              turn.startedAt ?? Date.now()
+            );
+            return;
+          }
+
+          updateTurn(projectId, turnId, (t) => ({
+            ...t,
+            phase: 'error',
+            phaseLabel: 'Paused',
+            errorMessage: 'Build paused while away. Send a message below to continue.',
+          }));
+          return;
+        }
+
+        if (!response.ok || !response.body) {
+          activeConnectionsRef.current.delete(turnId);
+          return;
+        }
+
+        await consumeSseStream(
+          projectId,
+          turnId,
+          turn.startedAt ?? Date.now(),
+          response
+        );
+        activeConnectionsRef.current.delete(turnId);
+      } catch {
+        activeConnectionsRef.current.delete(turnId);
+      }
+    },
+    [consumeSseStream, runBuilderStream, updateTurn]
+  );
+
+  const resumeJobStreamRef = useRef<
+    ((projectId: string, turnId: string, jobId?: string) => Promise<void>) | null
+  >(null);
+  resumeJobStreamRef.current = resumeJobStream;
+
+  // Reconnect any unfinished background builds on app startup, visibility return, or network recovery
+  useEffect(() => {
+    const syncUnfinishedJobs = (checkActiveSnapshots = false) => {
+      for (const proj of projectsRef.current) {
+        for (const turn of proj.turns) {
+          if (turn.phase !== 'understanding' && turn.phase !== 'building') {
+            continue;
+          }
+
+          if (!activeConnectionsRef.current.has(turn.id)) {
+            void resumeJobStreamRef.current?.(proj.id, turn.id, turn.jobId);
+          } else if (checkActiveSnapshots && turn.jobId) {
+            // Verify mobile Safari didn't silently freeze an active SSE socket while backgrounded
+            void (async () => {
+              try {
+                const res = await fetch(
+                  `/api/craft/jobs/${encodeURIComponent(turn.jobId!)}`
+                );
+                if (!res.ok) return;
+                const snap = (await res.json()) as {
+                  status?: 'running' | 'complete' | 'error';
+                  phase?: 'understanding' | 'building' | 'complete' | 'error';
+                  phaseLabel?: string;
+                  kind?: TurnKind;
+                  aiText?: string;
+                  previewHtml?: string;
+                  files?: string[];
+                  planSteps?: string[];
+                  suggestions?: string[];
+                  activeAction?: string;
+                  activeFile?: string;
+                  bytesBuilt?: number;
+                  thoughtSeconds?: number;
+                  modelId?: string;
+                  modelName?: string;
+                  provider?: string;
+                  errorMessage?: string;
+                };
+                if (snap.status === 'complete' || snap.status === 'error') {
+                  activeConnectionsRef.current.get(turn.id)?.abort();
+                  activeConnectionsRef.current.delete(turn.id);
+                  updateTurn(proj.id, turn.id, (t) => ({
+                    ...t,
+                    kind: snap.kind ?? t.kind,
+                    phase: snap.phase ?? t.phase,
+                    phaseLabel: snap.phaseLabel ?? t.phaseLabel,
+                    thoughtSeconds:
+                      typeof snap.thoughtSeconds === 'number'
+                        ? snap.thoughtSeconds
+                        : t.thoughtSeconds,
+                    aiText:
+                      typeof snap.aiText === 'string' && snap.aiText.trim()
+                        ? snap.aiText
+                        : t.aiText,
+                    previewHtml: snap.previewHtml || t.previewHtml,
+                    files: Array.isArray(snap.files) ? snap.files : t.files,
+                    planSteps: Array.isArray(snap.planSteps)
+                      ? snap.planSteps
+                      : t.planSteps,
+                    suggestions: Array.isArray(snap.suggestions)
+                      ? snap.suggestions
+                      : t.suggestions,
+                    activeAction: snap.activeAction ?? t.activeAction,
+                    activeFile: snap.activeFile ?? t.activeFile,
+                    bytesBuilt:
+                      typeof snap.bytesBuilt === 'number'
+                        ? snap.bytesBuilt
+                        : t.bytesBuilt,
+                    modelId: snap.modelId ?? t.modelId,
+                    modelName: snap.modelName ?? t.modelName,
+                    modelProvider: snap.provider ?? t.modelProvider,
+                    errorMessage: snap.errorMessage ?? t.errorMessage,
+                  }));
+                }
+              } catch {
+                // ignore background check failure
+              }
+            })();
+          }
+        }
+      }
+    };
+
+    syncUnfinishedJobs(false);
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        if (persistTimerRef.current !== null) {
+          window.clearTimeout(persistTimerRef.current);
+          persistTimerRef.current = null;
+        }
+        saveProjectsSafely(projectsRef.current);
+      } else if (document.visibilityState === 'visible') {
+        syncUnfinishedJobs(true);
+      }
+    };
+
+    const handlePageHide = () => {
+      if (persistTimerRef.current !== null) {
+        window.clearTimeout(persistTimerRef.current);
+        persistTimerRef.current = null;
+      }
+      saveProjectsSafely(projectsRef.current);
+    };
+
+    const handleOnline = () => {
+      syncUnfinishedJobs(true);
+    };
+
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('online', handleOnline);
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [updateTurn]);
+
+  const handleModeChange = (nextMode: BuildMode) => {
+    if (nextMode === mode) return;
+    setMode(nextMode);
+  };
+
+  // Immediately transforms to BuilderWorkspace when a message is sent from the first screen
+  // without ever interrupting or stopping any other project currently building
+  const handlePromptSubmit = (options: ComposerOptions) => {
+    const trimmed =
+      prompt.trim() ||
+      (options.attachmentName
+        ? `Build an app based on ${options.attachmentName}`
+        : '');
+    if (!trimmed) return;
+
+    unlockSpeechSynthesis();
+
+    const now = Date.now();
+    const projectId = `proj-${now}-${Math.random().toString(36).slice(2, 6)}`;
+    const turnId = `turn-${now}-${Math.random().toString(36).slice(2, 6)}`;
+    const currentModel = models.find((m) => m.id === selectedModel);
+    const chosenModelId = currentModel?.id || selectedModel || undefined;
+
+    const newTurn: BuilderTurn = {
+      id: turnId,
+      startedAt: now,
+      kind: 'chat',
+      userMessage: trimmed,
+      attachmentName: options.attachmentName,
+      attachmentDataUrl: options.attachmentDataUrl ?? null,
+      phase: 'understanding',
+      phaseLabel: 'Thinking...',
+      thoughtSeconds: 1,
+      activeAction: 'Thinking',
+      activeFile: '',
+      files: [],
+      bytesBuilt: 0,
+      aiText: '',
+      modelId: chosenModelId,
+      modelName: currentModel?.name,
+      modelProvider: currentModel?.provider,
+    };
+
+    const newProject: CraftProject = {
+      id: projectId,
+      title: deriveProjectTitle(trimmed, mode),
+      mode,
+      createdAt: new Date().toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+      }),
+      turns: [newTurn],
+    };
+
+    setProjects((prev) => [newProject, ...prev]);
+    setActiveProjectId(projectId);
+    setCredits((prev) => Math.max(0, prev - 1));
+    setPrompt('');
+    setViewMode('builder');
+
+    void runBuilderStream(
+      projectId,
+      turnId,
+      trimmed,
+      mode,
+      chosenModelId,
+      [],
+      options,
+      '',
+      now
+    );
+  };
+
+  const handleFollowUp = (message: string, options: ComposerOptions) => {
+    if (!activeProject || isProjectWorking(activeProject)) return;
+
+    unlockSpeechSynthesis();
+
+    const now = Date.now();
+    const turnId = `turn-${now}-${Math.random().toString(36).slice(2, 6)}`;
+    const currentModel = models.find((m) => m.id === selectedModel);
+    const chosenModelId = currentModel?.id || selectedModel || undefined;
+
+    const newTurn: BuilderTurn = {
+      id: turnId,
+      startedAt: now,
+      kind: 'chat',
+      userMessage: message,
+      attachmentName: options.attachmentName,
+      attachmentDataUrl: options.attachmentDataUrl ?? null,
+      phase: 'understanding',
+      phaseLabel: 'Thinking...',
+      thoughtSeconds: 1,
+      activeAction: 'Thinking',
+      activeFile: '',
+      files: [],
+      bytesBuilt: 0,
+      aiText: '',
+      modelId: chosenModelId,
+      modelName: currentModel?.name,
+      modelProvider: currentModel?.provider,
+    };
+
+    const history = activeProject.turns.flatMap((t) => [
+      { role: 'user', text: t.userMessage },
+      ...(t.aiText ? [{ role: 'model', text: t.aiText }] : []),
+    ]);
+
+    const previousHtml =
+      [...activeProject.turns]
+        .reverse()
+        .find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+
+    setProjects((prev) =>
+      prev.map((p) =>
+        p.id === activeProject.id ? { ...p, turns: [...p.turns, newTurn] } : p
+      )
+    );
+    setCredits((prev) => Math.max(0, prev - 1));
+
+    void runBuilderStream(
+      activeProject.id,
+      turnId,
+      message,
+      activeProject.mode,
+      chosenModelId,
+      history,
+      options,
+      previousHtml,
+      now
+    );
+  };
+
+  const handleScanClick = () => {
+    setInlineNotice('QR preview scanner ready');
+  };
+
+  const handleCreditsClick = () => {
+    setShowProUpgrade(true);
+  };
+
+  const handleActivateProPlan = (plan: ProPlanOption) => {
+    setProPlanId(plan.id);
+    setCredits((prev) => prev + plan.creditsToAdd);
+    setShowProUpgrade(false);
+    setInlineNotice(
+      `AI Craft ${plan.name} activated · +${plan.creditsToAdd.toLocaleString()} credits added`
+    );
+  };
+
+  const handleRestorePurchase = () => {
+    const savedPlan = loadSavedString(STORAGE_PRO_PLAN_KEY);
+    if (savedPlan) {
+      const matched = PRO_PLANS.find((p) => p.id === savedPlan);
+      setProPlanId(savedPlan);
+      return {
+        restored: true,
+        message: matched
+          ? `Restored AI Craft ${matched.name} (${matched.priceText}).`
+          : 'Restored active AI Craft Pro plan.',
+      };
+    }
+    return {
+      restored: false,
+      message: 'No previous subscription found on this device. Choose a plan below.',
+    };
+  };
+
+  const proModalElement = (
+    <ProUpgradeModal
+      open={showProUpgrade}
+      credits={credits}
+      activePlanId={proPlanId}
+      dynamicColorEnabled={dynamicColorEnabled}
+      onClose={() => setShowProUpgrade(false)}
+      onSelectActivatePlan={handleActivateProPlan}
+      onRestorePurchase={handleRestorePurchase}
+    />
+  );
+
+  if (viewMode === 'builder' && activeProject) {
+    const activeWorkspaceView: WorkspaceView =
+      projectViews[activeProject.id] ?? 'chat';
+
+    return (
+      <>
+        {activeWorkspaceView !== 'preview' && <OfflineIndicator />}
+        <BuilderWorkspace
+          projectId={activeProject.id}
+          projectTitle={activeProject.title}
+          mode={activeProject.mode}
+          credits={credits}
+          turns={activeProject.turns}
+          isStreaming={activeProjectIsStreaming}
+          activeView={activeWorkspaceView}
+          isPublished={Boolean(publishedProjects[activeProject.id])}
+          models={models}
+          selectedModel={selectedModel}
+          modelsLoading={modelsLoading}
+          modelsError={modelsError}
+          onSelectModel={setSelectedModel}
+          onRetryModels={() => void loadModels(true)}
+          onSetView={(view) => {
+            setProjectViews((prev) => ({
+              ...prev,
+              [activeProject.id]: view,
+            }));
+          }}
+          onPublish={() => {
+            setPublishedProjects((prev) => ({
+              ...prev,
+              [activeProject.id]: true,
+            }));
+          }}
+          onBack={() => {
+            if (activeWorkspaceView !== 'chat') {
+              setProjectViews((prev) => ({
+                ...prev,
+                [activeProject.id]: 'chat',
+              }));
+            } else {
+              setViewMode('home');
+              setActiveTab('create');
+            }
+          }}
+          onSendFollowUp={handleFollowUp}
+          onOpenApps={() => {
+            setViewMode('home');
+            setActiveTab('apps');
+          }}
+          onOpenSettings={() => {
+            setViewMode('home');
+            setActiveTab('setting');
+          }}
+          onOpenUpgrade={() => setShowProUpgrade(true)}
+          autoReadEnabled={autoReadEnabled}
+        />
+        {proModalElement}
+      </>
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 h-dvh w-full flex flex-col justify-between bg-white overflow-hidden overscroll-none select-none sm:select-auto">
+      {/* Full-Bleed Real-Time Dynamic Top Ambient Color Wash */}
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-x-0 top-0 h-[56dvh] transition-all duration-700 ease-out"
+        style={{
+          opacity: dynamicColorEnabled ? 0.92 + energyLevel * 0.08 : 0.35,
+          background:
+            mode === 'mobile'
+              ? 'radial-gradient(ellipse 85% 75% at 62% 20%, rgba(254, 240, 138, 0.55) 0%, rgba(254, 249, 195, 0.25) 45%, rgba(255, 255, 255, 0) 80%)'
+              : 'radial-gradient(ellipse 85% 75% at 38% 20%, rgba(245, 208, 254, 0.58) 0%, rgba(250, 232, 255, 0.28) 45%, rgba(255, 255, 255, 0) 80%)',
+        }}
+      />
+
+      {/* Non-intrusive offline indicator */}
+      <OfflineIndicator />
+
+      {/* Top Header */}
+      <TopBar
+        mode={mode}
+        credits={credits}
+        avatarDataUrl={userProfile.avatarDataUrl}
+        onScanClick={handleScanClick}
+        onCreditsClick={handleCreditsClick}
+        onAvatarClick={() => setActiveTab('setting')}
+        onOpenInstallGuide={() => setActiveTab('setting')}
+      />
+
+      {/* Live 3D Blinking Head — positioned strictly in the top-left circled space without altering layout */}
+      <div
+        aria-hidden={activeTab !== 'create'}
+        className={`pointer-events-none absolute inset-x-0 top-0 z-[25] max-w-[540px] mx-auto transition-opacity duration-200 ${
+          activeTab === 'create' ? 'opacity-100 visible' : 'opacity-0 invisible'
+        }`}
+      >
+        <div
+          className="pointer-events-auto absolute"
+          style={{
+            top: 'max(4px, env(safe-area-inset-top))',
+            left: 'clamp(58px, 16vw, 76px)',
+            width: 'clamp(114px, 31vw, 134px)',
+            height: 'clamp(114px, 31vw, 134px)',
+          }}
+        >
+          <Head3DOverlay active={activeTab === 'create'} />
+        </div>
+      </div>
+
+      {/* Main Content Area — Strictly Single Screen, No Overlapping Screens */}
+      <main className="relative z-10 flex-1 min-h-0 w-full flex flex-col">
+        <AnimatePresence mode="wait" initial={false}>
+          {activeTab === 'create' && (
+            <motion.section
+              key="screen-create"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+              className="flex-1 min-h-0 w-full max-w-[460px] mx-auto px-4 sm:px-6 pt-0 pb-1 flex flex-col justify-between items-center overflow-hidden"
+            >
+              {/* Hero Artwork + Copy */}
+              <HeroStage mode={mode} energyLevel={energyLevel} />
+
+              {/* Bottom Controls: Mode Switcher + Composer */}
+              <div className="shrink-0 w-full flex flex-col items-center gap-3.5">
+                {inlineNotice ? (
+                  <p
+                    role="status"
+                    className="text-xs font-medium text-[#52525B] tracking-[-0.01em]"
+                  >
+                    {inlineNotice}
+                  </p>
+                ) : null}
+
+                <ModeSwitcher mode={mode} onChange={handleModeChange} />
+
+                <PromptComposer
+                  mode={mode}
+                  prompt={prompt}
+                  onPromptChange={setPrompt}
+                  models={models}
+                  selectedModel={selectedModel}
+                  modelsLoading={modelsLoading}
+                  modelsError={modelsError}
+                  onSelectModel={setSelectedModel}
+                  onRetryModels={() => void loadModels(true)}
+                  onSubmit={handlePromptSubmit}
+                />
+              </div>
+            </motion.section>
+          )}
+
+          {activeTab === 'apps' && (
+            <motion.section
+              key="screen-apps"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+              className="flex-1 min-h-0 w-full max-w-[460px] mx-auto px-5 py-4 flex flex-col overflow-hidden"
+            >
+              <div className="flex-1 min-h-0 flex flex-col gap-4 overflow-hidden">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <img
+                      src="/logo-mark.png"
+                      alt="AI Craft logo"
+                      className="w-8 h-8 object-contain shrink-0"
+                    />
+                    <div className="min-w-0">
+                      <h1 className="font-display font-bold text-2xl tracking-tight text-[#0B0B0F] leading-none">
+                        Apps
+                      </h1>
+                      <p className="text-sm text-[#52525B] mt-1 truncate">
+                        Your crafted iOS, Android, and Web builds appear here.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('create')}
+                    className="shrink-0 inline-flex items-center gap-1.5 px-3.5 min-h-[36px] rounded-full bg-[#0B0B0F] text-white text-xs font-medium hover:bg-black/85 active:scale-95 transition-all"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    <span>New</span>
+                  </button>
+                </div>
+
+                {projects.length === 0 ? (
+                  <div className="rounded-[24px] border border-black/[0.08] bg-white p-6 text-center shadow-[0_6px_24px_rgba(15,15,30,0.04)]">
+                    <p className="font-display font-semibold text-base text-[#0B0B0F]">
+                      No builds started yet
+                    </p>
+                    <p className="text-sm text-[#71717A] mt-1.5">
+                      Describe your app or website idea on the Create screen to begin.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('create')}
+                      className="mt-4 inline-flex items-center gap-2 px-5 min-h-[42px] rounded-full bg-[#0B0B0F] text-white text-sm font-medium hover:bg-black/85 active:scale-[0.98] transition-all"
+                    >
+                      <span>Start Creating</span>
+                      <ArrowRight className="w-4 h-4" />
+                    </button>
+                  </div>
+                ) : (
+                  <ul className="flex flex-col gap-3">
+                    {projects.map((item) => {
+                      const firstTurn = item.turns[0];
+                      const latestTurn = item.turns[item.turns.length - 1];
+                      const itemWorking = isProjectWorking(item);
+                      const hasAppBuilt = item.turns.some((t) => Boolean(t.previewHtml));
+                      return (
+                        <li key={item.id}>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setActiveProjectId(item.id);
+                              setMode(item.mode);
+                              setViewMode('builder');
+                            }}
+                            className="w-full text-left rounded-2xl border border-black/[0.08] bg-white p-4 shadow-[0_4px_16px_rgba(15,15,30,0.03)] hover:border-black/20 active:scale-[0.99] transition-all flex items-center justify-between gap-3"
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2 text-xs text-[#71717A] flex-wrap">
+                                <span className="font-semibold text-[#0B0B0F]">
+                                  {item.title}
+                                </span>
+                                <span aria-hidden="true">·</span>
+                                <span>{MODE_THEMES[item.mode].label}</span>
+                                <span aria-hidden="true">·</span>
+                                <span className="tabular-nums">
+                                  {item.createdAt}
+                                </span>
+                                {itemWorking ? (
+                                  <span
+                                    className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium"
+                                    style={{
+                                      backgroundColor: MODE_THEMES[item.mode].accentSoft,
+                                      color: MODE_THEMES[item.mode].accentColor,
+                                    }}
+                                  >
+                                    <Loader2 className="w-3 h-3 animate-spin" />
+                                    <span>
+                                      {latestTurn?.phase === 'building'
+                                        ? 'Building'
+                                        : 'Thinking'}
+                                    </span>
+                                  </span>
+                                ) : hasAppBuilt ? (
+                                  <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 text-[11px] font-medium">
+                                    Ready
+                                  </span>
+                                ) : null}
+                              </div>
+                              {firstTurn && (
+                                <p className="mt-1.5 text-sm text-[#27272F] truncate">
+                                  {firstTurn.userMessage}
+                                </p>
+                              )}
+                            </div>
+                            <ChevronRight className="w-4 h-4 text-[#71717A] shrink-0" />
+                          </button>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                )}
+              </div>
+            </motion.section>
+          )}
+
+          {activeTab === 'setting' && (
+            <motion.section
+              key="screen-profile"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+              className="flex-1 min-h-0 w-full flex flex-col"
+            >
+              <ProfileSection
+                profile={userProfile}
+                credits={credits}
+                proPlanId={proPlanId}
+                projectCount={projects.length}
+                mode={mode}
+                dynamicColorEnabled={dynamicColorEnabled}
+                notificationsEnabled={notificationsEnabled}
+                autoReadEnabled={autoReadEnabled}
+                onUpdateProfile={setUserProfile}
+                onToggleNotifications={async () => {
+                  if (notificationsEnabled) {
+                    setNotificationsEnabled(false);
+                    return;
+                  }
+                  if (typeof Notification !== 'undefined') {
+                    try {
+                      if (Notification.permission === 'default') {
+                        const perm = await Notification.requestPermission();
+                        if (perm === 'denied') {
+                          setInlineNotice('Notifications blocked in browser settings');
+                          return;
+                        }
+                      } else if (Notification.permission === 'denied') {
+                        setInlineNotice('Notifications blocked in browser settings');
+                        return;
+                      }
+                    } catch {
+                      // proceed with local preference toggle if browser restricts API
+                    }
+                  }
+                  setNotificationsEnabled(true);
+                }}
+                onToggleAutoRead={() => setAutoReadEnabled((v) => !v)}
+                onToggleDynamicColor={() => setDynamicColorEnabled((v) => !v)}
+                onToggleMode={() => setMode(mode === 'mobile' ? 'web' : 'mobile')}
+                onOpenProPlans={() => setShowProUpgrade(true)}
+                onClearProjects={() => {
+                  activeConnectionsRef.current.forEach((ctrl) => ctrl.abort());
+                  activeConnectionsRef.current.clear();
+                  setProjects([]);
+                  setActiveProjectId(null);
+                  setProjectViews({});
+                  setPublishedProjects({});
+                }}
+                onBackToCreate={() => setActiveTab('create')}
+              />
+            </motion.section>
+          )}
+        </AnimatePresence>
+      </main>
+
+      {/* Bottom Tab Bar */}
+      <BottomNav activeTab={activeTab} onChange={setActiveTab} />
+
+      {proModalElement}
+    </div>
+  );
+}

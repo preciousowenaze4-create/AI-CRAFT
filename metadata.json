@@ -1,0 +1,6 @@
+{
+  "name": "AI Craft",
+  "description": "AI Craft — Build iOS, Android, and Full-Stack Web Apps instantly with no code.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

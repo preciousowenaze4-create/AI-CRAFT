@@ -1,0 +1,1481 @@
+import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  AlertCircle,
+  ArrowDown,
+  ArrowUp,
+  ArrowUpRight,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  Eye,
+  Globe,
+  HelpCircle,
+  Lightbulb,
+  Loader2,
+  MoreVertical,
+  Paperclip,
+  Volume2,
+  X,
+} from 'lucide-react';
+import { useSpeechNarration } from '../hooks/useSpeechNarration';
+import { useVoiceDictation } from '../hooks/useVoiceDictation';
+import {
+  BuildMode,
+  BuilderTurn,
+  ComposerOptions,
+  MODE_THEMES,
+  OpenRouterModel,
+  WorkspaceView,
+} from '../types/craft';
+import { ProcessedAttachment, readAttachmentFile } from '../utils/attachment';
+import { FloatingLogoMenu } from './FloatingLogoMenu';
+import { LivingBotanicalWallpaper } from './LivingBotanicalWallpaper';
+import { ModelSelectorPopover } from './ModelSelectorPopover';
+import { ProviderLogo } from './ProviderLogo';
+import { VoiceInputButton } from './VoiceInputButton';
+
+function formatBuildStepLabel(filePath: string): string {
+  if (filePath === 'index.html') return 'App layout';
+  if (filePath === 'styles.css') return 'Design & styling';
+  if (filePath === 'app.js') return 'Real-time data & logic';
+  if (filePath === 'components/header.html') return 'Header bar';
+  if (filePath === 'components/navigation.html') return 'Navigation';
+  if (filePath === 'components/canvas.html') return 'Interactive canvas';
+  if (filePath === 'components/form.html') return 'Interactive form';
+  if (filePath === 'components/footer.html') return 'Footer';
+
+  const slug = filePath
+    .replace(/^screens\//, '')
+    .replace(/^components\//, '')
+    .replace(/\.html$/i, '')
+    .replace(/[-_]+/g, ' ')
+    .trim();
+  if (!slug) return filePath;
+  const titled = slug.charAt(0).toUpperCase() + slug.slice(1);
+  return filePath.startsWith('screens/') ? `${titled} screen` : titled;
+}
+
+function sanitizeDisplayProse(raw: string, isBuildTurn: boolean): string {
+  const cleaned = raw
+    .replace(/\[\[\s*INTENT\s*:\s*(?:CHAT|BUILD)\s*\]\]/gi, '')
+    .replace(/\[\[\s*PLAN\s*:[^\]]*\]\]\s*\n?/gi, '')
+    .replace(/\[\[\s*SUGGESTIONS\s*\]\][\s\S]*?(?:\[\[\s*\/\s*SUGGESTIONS\s*\]\]|$)/gi, '');
+  if (!isBuildTurn) return cleaned.trim();
+  return cleaned
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/```[\s\S]*/g, '')
+    .replace(/<<<\s*AICRAFT_APP_HTML\s*>>>[\s\S]*/gi, '')
+    .replace(/<!doctype\s+html[\s\S]*/gi, '')
+    .replace(/<html\b[\s\S]*/gi, '')
+    .replace(/<(?:style|script)\b[\s\S]*/gi, '')
+    .replace(/^\s*(?:PART\s*[123]\s*[:\-–]?)\s*/gim, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+interface BuilderWorkspaceProps {
+  projectId: string;
+  projectTitle: string;
+  mode: BuildMode;
+  credits: number;
+  turns: BuilderTurn[];
+  isStreaming: boolean;
+  activeView: WorkspaceView;
+  isPublished: boolean;
+  models: OpenRouterModel[];
+  selectedModel: string;
+  modelsLoading: boolean;
+  modelsError: string | null;
+  onSelectModel: (modelId: string) => void;
+  onRetryModels: () => void;
+  onSetView: (view: WorkspaceView) => void;
+  onPublish: () => void;
+  onBack: () => void;
+  onSendFollowUp: (message: string, options: ComposerOptions) => void;
+  onOpenApps: () => void;
+  onOpenSettings: () => void;
+  onOpenUpgrade: () => void;
+  autoReadEnabled?: boolean;
+}
+
+export function BuilderWorkspace({
+  projectId,
+  projectTitle,
+  mode,
+  credits,
+  turns,
+  isStreaming,
+  activeView,
+  isPublished,
+  models,
+  selectedModel,
+  modelsLoading,
+  modelsError,
+  onSelectModel,
+  onRetryModels,
+  onSetView,
+  onPublish,
+  onBack,
+  onSendFollowUp,
+  onOpenApps,
+  onOpenSettings,
+  onOpenUpgrade,
+  autoReadEnabled = true,
+}: BuilderWorkspaceProps) {
+  const theme = MODE_THEMES[mode];
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const previewIframeRef = useRef<HTMLIFrameElement | null>(null);
+
+  const [followUp, setFollowUp] = useState('');
+  const [attachment, setAttachment] = useState<ProcessedAttachment | null>(null);
+  const [webSearchEnabled, setWebSearchEnabled] = useState(true);
+  const [collapsedTurnIds, setCollapsedTurnIds] = useState<Record<string, boolean>>({});
+  const [showHeaderActions, setShowHeaderActions] = useState(false);
+  const [autoAllow, setAutoAllow] = useState(true);
+  const [showScrollBottom, setShowScrollBottom] = useState(false);
+  const [previewKey, setPreviewKey] = useState(0);
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [activeCodeTab, setActiveCodeTab] = useState<'index.html' | 'styles.css' | 'app.js'>('index.html');
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const hasWorkingTurn = useMemo(
+    () => turns.some((t) => t.phase === 'understanding' || t.phase === 'building'),
+    [turns]
+  );
+
+  useEffect(() => {
+    if (!hasWorkingTurn) return;
+    setNowMs(Date.now());
+    const id = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [hasWorkingTurn]);
+
+  const {
+    status: voiceStatus,
+    isListening: isVoiceListening,
+    isTranscribing: isVoiceTranscribing,
+    voiceLevel,
+    error: voiceError,
+    clearError: clearVoiceError,
+    stop: stopVoice,
+    toggle: toggleVoice,
+  } = useVoiceDictation({
+    text: followUp,
+    onTextChange: setFollowUp,
+  });
+
+  useEffect(() => {
+    if (!voiceError) return;
+    const t = window.setTimeout(clearVoiceError, 3200);
+    return () => window.clearTimeout(t);
+  }, [voiceError, clearVoiceError]);
+
+  useEffect(() => {
+    stopVoice();
+    setFollowUp('');
+    setAttachment(null);
+    setShowHeaderActions(false);
+    setShowScrollBottom(false);
+    setActiveCodeTab('index.html');
+  }, [projectId, stopVoice]);
+
+  const {
+    supported: ttsSupported,
+    speakingTurnId,
+    speakTurn,
+    stop: stopSpeech,
+  } = useSpeechNarration();
+  const narratedTurnIdsRef = useRef<Set<string>>(new Set());
+  const prevProjectIdRef = useRef<string | null>(null);
+
+  const latestPreviewHtml =
+    [...turns].reverse().find((t) => Boolean(t.previewHtml))?.previewHtml ?? '';
+  const hasBuiltApp = latestPreviewHtml.length > 0;
+
+  const codeParts = useMemo(() => {
+    if (!latestPreviewHtml) {
+      return [{ id: 'index.html' as const, label: 'index.html', content: '' }];
+    }
+    const parts: Array<{ id: 'index.html' | 'styles.css' | 'app.js'; label: string; content: string }> = [
+      { id: 'index.html', label: 'index.html', content: latestPreviewHtml },
+    ];
+    const styleMatches = Array.from(
+      latestPreviewHtml.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi)
+    )
+      .map((m) => m[1]?.trim() ?? '')
+      .filter(Boolean);
+    if (styleMatches.length > 0) {
+      parts.push({
+        id: 'styles.css',
+        label: 'styles.css',
+        content: styleMatches.join('\n\n'),
+      });
+    }
+    const scriptMatches = Array.from(
+      latestPreviewHtml.matchAll(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi)
+    )
+      .map((m) => m[1]?.trim() ?? '')
+      .filter(Boolean);
+    if (scriptMatches.length > 0) {
+      parts.push({
+        id: 'app.js',
+        label: 'app.js',
+        content: scriptMatches.join('\n\n'),
+      });
+    }
+    return parts;
+  }, [latestPreviewHtml]);
+
+  // Inject window.AICraft bridge so built apps inside Preview can call the selected AI live
+  const connectedPreviewHtml = useMemo(() => {
+    if (!latestPreviewHtml) return '';
+    const bridgeScript = `<script>
+(function(){
+  if (window.AICraft) return;
+  var pending = {};
+  window.addEventListener('message', function(e) {
+    var d = e.data;
+    if (!d || d.type !== 'aicraft:reply' || !d.id) return;
+    var cb = pending[d.id];
+    if (!cb) return;
+    delete pending[d.id];
+    if (d.error) cb.reject(new Error(d.error));
+    else if (typeof d.data !== 'undefined') cb.resolve(d.data);
+    else cb.resolve(d.text || '');
+  });
+  function ask(prompt) {
+    return new Promise(function(resolve, reject) {
+      var id = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      pending[id] = { resolve: resolve, reject: reject };
+      window.parent.postMessage({ type: 'aicraft:ask', id: id, prompt: String(prompt || '') }, '*');
+    });
+  }
+  function search(query) {
+    return new Promise(function(resolve, reject) {
+      var id = 'srch_' + Date.now() + '_' + Math.random().toString(36).slice(2);
+      pending[id] = { resolve: resolve, reject: reject };
+      window.parent.postMessage({ type: 'aicraft:search', id: id, query: String(query || '') }, '*');
+    });
+  }
+  window.AICraft = {
+    ask: ask,
+    chat: ask,
+    search: search,
+    edit: function(instruction) {
+      window.parent.postMessage({ type: 'aicraft:edit', instruction: String(instruction || '') }, '*');
+    }
+  };
+})();
+</script>`;
+    if (/<\/head>/i.test(latestPreviewHtml)) {
+      return latestPreviewHtml.replace(/<\/head>/i, `${bridgeScript}</head>`);
+    }
+    return `${bridgeScript}${latestPreviewHtml}`;
+  }, [latestPreviewHtml]);
+
+  const activeModel = useMemo(
+    () => models.find((m) => m.id === selectedModel) ?? null,
+    [models, selectedModel]
+  );
+
+  const hasContent = followUp.trim().length > 0 || attachment !== null;
+
+  // Connect preview iframe postMessage bridge to live OpenRouter/AI stream and browser search
+  useEffect(() => {
+    const handleBridgeMessage = async (event: MessageEvent) => {
+      const data = event.data as
+        | {
+            type?: string;
+            id?: string;
+            prompt?: string;
+            query?: string;
+            instruction?: string;
+          }
+        | undefined;
+      if (!data?.type) return;
+
+      if (data.type === 'aicraft:edit' && data.instruction?.trim()) {
+        onSetView('chat');
+        onSendFollowUp(data.instruction.trim(), {
+          reactEnabled: mode === 'web',
+          backendEnabled: false,
+          webSearchEnabled,
+          attachmentName: null,
+        });
+        return;
+      }
+
+      if (data.type === 'aicraft:search' && data.id && data.query?.trim()) {
+        const replyTarget = previewIframeRef.current?.contentWindow;
+        try {
+          const response = await fetch(
+            `/api/search?q=${encodeURIComponent(data.query.trim())}`
+          );
+          const json = (await response.json()) as {
+            query?: string;
+            results?: Array<{ title: string; snippet: string; url: string; source: string; imageUrl?: string }>;
+            images?: Array<{ title: string; imageUrl: string; source: string }>;
+          };
+          replyTarget?.postMessage(
+            {
+              type: 'aicraft:reply',
+              id: data.id,
+              data: {
+                query: json.query ?? data.query.trim(),
+                results: Array.isArray(json.results) ? json.results : [],
+                images: Array.isArray(json.images) ? json.images : [],
+              },
+            },
+            '*'
+          );
+        } catch (err) {
+          replyTarget?.postMessage(
+            {
+              type: 'aicraft:reply',
+              id: data.id,
+              error: err instanceof Error ? err.message : 'Search failed.',
+            },
+            '*'
+          );
+        }
+        return;
+      }
+
+      if (data.type === 'aicraft:ask' && data.id && data.prompt?.trim()) {
+        const replyTarget = previewIframeRef.current?.contentWindow;
+        try {
+          const response = await fetch('/api/craft/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              message: data.prompt.trim(),
+              mode,
+              model: selectedModel || undefined,
+              clientTime: new Date().toLocaleString(),
+              clientTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+              options: { webSearchEnabled, forceChat: true },
+            }),
+          });
+          if (!response.ok || !response.body) {
+            throw new Error('Unable to reach AI Craft engine.');
+          }
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          let fullText = '';
+          let streamErr = '';
+
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const events = buffer.split('\n\n');
+            buffer = events.pop() ?? '';
+            for (const rawEvent of events) {
+              const line = rawEvent.split('\n').find((l) => l.startsWith('data: '));
+              if (!line) continue;
+              try {
+                const evt = JSON.parse(line.slice(6)) as {
+                  type: string;
+                  text?: string;
+                  fullText?: string;
+                  message?: string;
+                };
+                if (evt.type === 'reset') fullText = '';
+                else if (evt.type === 'delta' && evt.text) fullText += evt.text;
+                else if (evt.type === 'done' && evt.fullText) fullText = evt.fullText;
+                else if (evt.type === 'error' && evt.message) streamErr = evt.message;
+              } catch {
+                // ignore malformed chunk
+              }
+            }
+          }
+
+          replyTarget?.postMessage(
+            {
+              type: 'aicraft:reply',
+              id: data.id,
+              text: fullText,
+              error: streamErr || undefined,
+            },
+            '*'
+          );
+        } catch (err) {
+          replyTarget?.postMessage(
+            {
+              type: 'aicraft:reply',
+              id: data.id,
+              error: err instanceof Error ? err.message : 'AI request failed.',
+            },
+            '*'
+          );
+        }
+      }
+    };
+
+    window.addEventListener('message', handleBridgeMessage);
+    return () => window.removeEventListener('message', handleBridgeMessage);
+  }, [mode, selectedModel, onSetView, onSendFollowUp]);
+
+  // Zero-lag rAF auto-scroll while streaming
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (distanceFromBottom < 180 || isStreaming) {
+      const raf = window.requestAnimationFrame(() => {
+        el.scrollTop = el.scrollHeight;
+      });
+      return () => window.cancelAnimationFrame(raf);
+    }
+  }, [turns, isStreaming]);
+
+  // Automatic browser-native TTS narration when a new AI response completes
+  useEffect(() => {
+    if (prevProjectIdRef.current !== projectId) {
+      prevProjectIdRef.current = projectId;
+      stopSpeech();
+      // Do not replay pre-existing historical turns when opening an older project
+      narratedTurnIdsRef.current = new Set(
+        turns
+          .filter((t) => t.phase === 'complete' && !t.errorMessage)
+          .map((t) => t.id)
+      );
+      return;
+    }
+
+    const newlyCompleted = turns.filter(
+      (t) =>
+        t.phase === 'complete' &&
+        !t.errorMessage &&
+        t.aiText.trim().length > 0 &&
+        !narratedTurnIdsRef.current.has(t.id)
+    );
+
+    if (newlyCompleted.length > 0) {
+      newlyCompleted.forEach((t) => narratedTurnIdsRef.current.add(t.id));
+      if (autoReadEnabled) {
+        const latestTurn = newlyCompleted[newlyCompleted.length - 1];
+        const spokenText = sanitizeDisplayProse(
+          latestTurn.aiText,
+          latestTurn.kind === 'build'
+        );
+        if (spokenText) {
+          speakTurn(latestTurn.id, spokenText);
+        }
+      }
+    }
+  }, [projectId, turns, speakTurn, stopSpeech, autoReadEnabled]);
+
+  const handleScroll = () => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    setShowScrollBottom(distanceFromBottom > 120);
+  };
+
+  const scrollToBottom = () => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const processed = await readAttachmentFile(file);
+    setAttachment(processed);
+  };
+
+  const handleSubmit = () => {
+    if (!hasContent || isStreaming) return;
+    stopVoice();
+    const text =
+      followUp.trim() ||
+      (attachment?.dataUrl
+        ? `Analyze this screenshot (${attachment.name}) and update the app preview to fix or remove what needs changing while keeping the rest intact.`
+        : `Attached reference: ${attachment?.name ?? 'file'}`);
+    onSendFollowUp(text, {
+      reactEnabled: mode === 'web',
+      backendEnabled: false,
+      webSearchEnabled,
+      attachmentName: attachment?.name ?? null,
+      attachmentDataUrl: attachment?.dataUrl ?? null,
+      attachmentMimeType: attachment?.mimeType ?? null,
+      attachmentText: attachment?.textContent ?? null,
+    });
+    setFollowUp('');
+    setAttachment(null);
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
+
+  const handleShare = async (): Promise<string> => {
+    const shareText = `${projectTitle} — Built with AI Craft`;
+    try {
+      if (navigator.share) {
+        await navigator.share({
+          title: projectTitle,
+          text: shareText,
+          url: window.location.href,
+        });
+        return 'Shared successfully';
+      }
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(window.location.href);
+        return 'App link copied';
+      }
+    } catch {
+      // User cancelled share or clipboard blocked
+    }
+    return 'Ready to share';
+  };
+
+  const handleCopyCode = async () => {
+    if (!latestPreviewHtml) return;
+    try {
+      await navigator.clipboard.writeText(latestPreviewHtml);
+      setCopiedCode(true);
+      window.setTimeout(() => setCopiedCode(false), 2000);
+    } catch {
+      // ignore clipboard restriction
+    }
+  };
+
+  // Full-screen Preview Mode: renders built app full-screen (or Living Botanical Wallpaper if not built yet)
+  // plus the draggable right-side round blue AI Craft logo button
+  if (activeView === 'preview') {
+    return (
+      <div className="fixed inset-0 w-full h-full min-h-[100lvh] overflow-hidden">
+        {hasBuiltApp ? (
+          <iframe
+            ref={previewIframeRef}
+            key={`${projectId}-${previewKey}`}
+            title={`${projectTitle} Preview`}
+            srcDoc={connectedPreviewHtml}
+            sandbox="allow-scripts allow-forms allow-modals"
+            className="w-full h-full border-0 block bg-white"
+          />
+        ) : (
+          <LivingBotanicalWallpaper isBuilding={isStreaming} />
+        )}
+
+        <FloatingLogoMenu
+          projectTitle={projectTitle}
+          hasBuiltApp={hasBuiltApp}
+          isPublished={isPublished}
+          onBackToChat={() => onSetView('chat')}
+          onViewCode={() => onSetView('code')}
+          onShare={handleShare}
+          onPublish={onPublish}
+          onRefreshPreview={() => setPreviewKey((k) => k + 1)}
+          onOpenApps={onOpenApps}
+        />
+      </div>
+    );
+  }
+
+  // Code Viewer Mode (accessed from clicking the floating round logo -> View App Code)
+  if (activeView === 'code') {
+    const selectedCodePart =
+      codeParts.find((p) => p.id === activeCodeTab) ?? codeParts[0];
+
+    return (
+      <div className="relative h-dvh w-full flex flex-col bg-white overflow-hidden">
+        <header className="shrink-0 w-full bg-white border-b border-black/[0.06] pt-safe">
+          <div className="w-full max-w-[680px] mx-auto px-3 py-2 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 min-w-0">
+              <button
+                type="button"
+                onClick={() => onSetView('preview')}
+                aria-label="Back to Preview"
+                className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#0B0B0F] hover:bg-black/[0.04] active:scale-95 transition-all shrink-0"
+              >
+                <ChevronLeft className="w-6 h-6 stroke-[2]" />
+              </button>
+              <h1 className="font-display font-bold text-[16px] tracking-[-0.02em] text-[#0B0B0F] truncate">
+                {projectTitle} · Code
+              </h1>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => void handleCopyCode()}
+                className="h-9 px-3 rounded-xl border border-black/15 bg-white text-xs font-medium text-[#0B0B0F] hover:bg-black/[0.03] flex items-center gap-1.5 whitespace-nowrap"
+              >
+                {copiedCode ? (
+                  <>
+                    <Check className="w-3.5 h-3.5 text-[#0D6BFF]" />
+                    <span>Copied</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>Copy Code</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => onSetView('chat')}
+                className="h-9 px-3 rounded-xl bg-[#0B0B0F] text-white text-xs font-medium whitespace-nowrap"
+              >
+                Chat
+              </button>
+            </div>
+          </div>
+
+          {codeParts.length > 1 && (
+            <div className="w-full max-w-[680px] mx-auto px-3 pb-2 flex items-center gap-1.5 overflow-x-auto">
+              {codeParts.map((part) => {
+                const isSelected = selectedCodePart.id === part.id;
+                return (
+                  <button
+                    key={part.id}
+                    type="button"
+                    onClick={() => setActiveCodeTab(part.id)}
+                    className={`px-3 py-1 rounded-lg text-xs font-mono transition-colors shrink-0 ${
+                      isSelected
+                        ? 'bg-[#0B0B0F] text-white'
+                        : 'bg-[#F4F4F6] text-[#52525B] hover:text-[#0B0B0F]'
+                    }`}
+                  >
+                    {part.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </header>
+
+        <div className="flex-1 min-h-0 overflow-auto bg-[#0F1117] text-[#E4E4E7] p-4">
+          <pre className="w-full max-w-[680px] mx-auto text-[12.5px] leading-relaxed font-mono whitespace-pre-wrap break-words">
+            <code>{selectedCodePart?.content || 'No generated code yet.'}</code>
+          </pre>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative h-dvh w-full flex flex-col justify-between bg-white overflow-hidden">
+      {/* Top Workspace Header Bar */}
+      <header className="shrink-0 w-full bg-white border-b border-black/[0.06] pt-safe">
+        <div className="w-full max-w-[540px] mx-auto px-3 py-2 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <button
+              type="button"
+              onClick={onBack}
+              aria-label="Back to Create"
+              className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#0B0B0F] hover:bg-black/[0.04] active:scale-95 transition-all shrink-0"
+            >
+              <ChevronLeft className="w-6 h-6 stroke-[2]" />
+            </button>
+
+            <Globe className="w-[18px] h-[18px] text-[#111118] shrink-0 stroke-[1.8]" />
+
+            <h1 className="font-display font-bold text-[17px] tracking-[-0.02em] text-[#0B0B0F] truncate">
+              {projectTitle}
+            </h1>
+          </div>
+
+          <div className="flex items-center gap-1.5 shrink-0">
+            {/* Small rounded-box Preview button beside the top-right menu */}
+            <button
+              type="button"
+              onClick={() => onSetView('preview')}
+              aria-label={`Preview ${projectTitle}`}
+              className="h-9 px-2.5 rounded-xl border bg-white text-[#0B0B0F] border-black/15 hover:bg-black/[0.03] flex items-center gap-1.5 text-[13px] font-medium whitespace-nowrap shrink-0 active:scale-95 transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6]"
+            >
+              <Eye className="w-4 h-4 stroke-[2]" />
+              <span>Preview</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowHeaderActions((v) => !v)}
+              aria-label="Workspace actions"
+              aria-expanded={showHeaderActions}
+              className="min-w-[40px] min-h-[40px] rounded-full flex items-center justify-center text-[#111118] hover:bg-black/[0.04] active:scale-95 transition-all"
+            >
+              <MoreVertical className="w-5 h-5 stroke-[1.9]" />
+            </button>
+          </div>
+        </div>
+
+        {/* Inline non-overlapping action strip when menu toggled */}
+        {showHeaderActions && (
+          <div className="w-full max-w-[540px] mx-auto px-4 pb-2.5 flex items-center justify-between gap-2 border-t border-black/[0.04] pt-2 text-xs">
+            <span className="text-[#52525B] font-medium">
+              Target: {theme.label}
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowHeaderActions(false);
+                  onOpenApps();
+                }}
+                className="px-3 py-1.5 rounded-full bg-[#F4F4F6] text-[#0B0B0F] font-medium hover:bg-[#E4E4E7]"
+              >
+                Apps
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowHeaderActions(false);
+                  onBack();
+                }}
+                className="px-3 py-1.5 rounded-full bg-[#0B0B0F] text-white font-medium"
+              >
+                New Build
+              </button>
+            </div>
+          </div>
+        )}
+      </header>
+
+      {/* Scrollable AI Understanding & Building Stream */}
+      <div className="relative flex-1 min-h-0 w-full">
+        <div
+          ref={scrollContainerRef}
+          onScroll={handleScroll}
+          className="h-full w-full overflow-y-auto px-5 py-4"
+        >
+          <div className="w-full max-w-[500px] mx-auto flex flex-col gap-6 pb-4">
+            {turns.map((turn) => {
+              const isExpanded = !collapsedTurnIds[turn.id];
+              const isBuildTurn = turn.kind === 'build';
+              const isTurnWorking =
+                turn.phase === 'understanding' || turn.phase === 'building';
+              const displayAiText = sanitizeDisplayProse(turn.aiText, isBuildTurn);
+
+              const stepUnderstandingDone = turn.phase !== 'understanding';
+              const stepBuildingDone = turn.phase === 'complete';
+
+              const toggleTurnExpanded = () =>
+                setCollapsedTurnIds((prev) => ({
+                  ...prev,
+                  [turn.id]: !prev[turn.id],
+                }));
+
+              const turnModelName =
+                turn.modelName ||
+                models.find((m) => m.id === turn.modelId)?.name ||
+                activeModel?.name ||
+                'AICRAFT';
+
+              return (
+                <article key={turn.id} className="flex flex-col gap-3.5">
+                  {/* User Message Bubble */}
+                  <div className="flex justify-end">
+                    <div className="max-w-[88%] rounded-2xl rounded-br-sm bg-[#F4F4F6] px-3.5 py-2.5 text-[14.5px] leading-snug text-[#111118]">
+                      {turn.attachmentDataUrl && (
+                        <img
+                          src={turn.attachmentDataUrl}
+                          alt={turn.attachmentName || 'Screenshot attachment'}
+                          className="mb-2 max-h-44 w-auto rounded-xl border border-black/10 object-cover"
+                        />
+                      )}
+                      <p className="whitespace-pre-wrap">{turn.userMessage}</p>
+                      {turn.attachmentName && !turn.attachmentDataUrl && (
+                        <p className="mt-1 text-xs text-[#71717A]">
+                          Attached: {turn.attachmentName}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Active AI Model Brand Row with Real-Time Logo Tracking */}
+                  <div className="flex items-center justify-between pt-0.5 gap-2">
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <ProviderLogo
+                        provider={turn.modelProvider || activeModel?.provider}
+                        modelId={turn.modelId || selectedModel}
+                        size={22}
+                        isTracking={isTurnWorking}
+                        trackingColor={theme.accentColor}
+                      />
+                      <div className="min-w-0 flex items-center gap-2">
+                        <span className="font-display font-bold text-[14.5px] tracking-[-0.01em] text-[#0B0B0F] truncate">
+                          {turnModelName}
+                        </span>
+                        {isTurnWorking && (
+                          <span
+                            className="text-[11.5px] font-medium shrink-0"
+                            style={{ color: theme.accentColor }}
+                          >
+                            {turn.phase === 'building'
+                              ? 'Building'
+                              : displayAiText.length > 0
+                                ? 'Responding'
+                                : 'Thinking'}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {isBuildTurn && turn.phase !== 'understanding' && (
+                      <button
+                        type="button"
+                        onClick={toggleTurnExpanded}
+                        aria-label="Toggle build file details"
+                        className="p-1.5 rounded-full text-[#52525B] hover:bg-black/[0.04] shrink-0"
+                      >
+                        <MoreVertical className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Live Thought Timer Row */}
+                  <div className="flex items-center gap-2 text-[13.5px] text-[#71717A]">
+                    <Lightbulb className="w-[16px] h-[16px] shrink-0 stroke-[1.8]" />
+                    <span className="tabular-nums">
+                      {isTurnWorking
+                        ? `${turn.phaseLabel} (${
+                            turn.startedAt
+                              ? Math.max(1, Math.floor((nowMs - turn.startedAt) / 1000))
+                              : Math.max(1, turn.thoughtSeconds)
+                          }s)`
+                        : `Thought for ${Math.max(1, turn.thoughtSeconds)}s`}
+                    </span>
+                  </div>
+
+                  {/* Calm Step-by-Step Architectural & Monetization Plan */}
+                  {turn.planSteps && turn.planSteps.length > 0 && (
+                    <div className="rounded-2xl border border-black/[0.07] bg-[#FAFAFC] px-3.5 py-2.5 flex flex-col gap-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[12px] font-semibold uppercase tracking-[0.04em] text-[#52525B]">
+                          Architecture & Monetization Plan
+                        </span>
+                        <span className="text-[11.5px] font-medium text-[#71717A] tabular-nums">
+                          {turn.phase === 'understanding'
+                            ? `Step ${turn.planSteps.length}`
+                            : `${turn.planSteps.length} steps`}
+                        </span>
+                      </div>
+                      <ul className="space-y-1.5 text-[13px] leading-snug">
+                        {turn.planSteps.map((step, idx) => {
+                          const isActivePlanStep =
+                            turn.phase === 'understanding' &&
+                            idx === turn.planSteps!.length - 1;
+                          return (
+                            <li
+                              key={`${turn.id}-plan-${idx}`}
+                              className="flex items-start gap-2"
+                            >
+                              {isActivePlanStep ? (
+                                <Loader2
+                                  className="w-3.5 h-3.5 mt-0.5 animate-spin shrink-0"
+                                  style={{ color: theme.accentColor }}
+                                />
+                              ) : (
+                                <CheckCircle2 className="w-3.5 h-3.5 mt-0.5 text-emerald-600 shrink-0" />
+                              )}
+                              <span
+                                className={
+                                  isActivePlanStep
+                                    ? 'text-[#111118] font-medium'
+                                    : 'text-[#3F3F46]'
+                                }
+                              >
+                                {step}
+                              </span>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  )}
+
+                  {/* Real-Time Build Checklist & Progress Bar (Shown once building starts) */}
+                  {isBuildTurn &&
+                    (turn.phase === 'building' ||
+                      turn.phase === 'complete' ||
+                      turn.files.length > 0) && (() => {
+                    const bytes = turn.bytesBuilt ?? turn.previewHtml?.length ?? 0;
+                    const kbLabel =
+                      bytes >= 1024
+                        ? `${(bytes / 1024).toFixed(1)} KB`
+                        : bytes > 0
+                          ? `${bytes} B`
+                          : '';
+                    const progressPct =
+                      turn.phase === 'complete'
+                        ? 100
+                        : turn.files.length === 0
+                          ? 14
+                          : Math.min(94, 22 + Math.round((Math.min(bytes, 14000) / 14000) * 72));
+
+                    return (
+                      <div className="rounded-2xl bg-[#F4F4F6] px-3.5 py-2.5 flex flex-col gap-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div className="flex items-center gap-2 min-w-0 flex-1">
+                            {isTurnWorking ? (
+                              <Loader2
+                                className="w-4 h-4 animate-spin shrink-0"
+                                style={{ color: theme.accentColor }}
+                              />
+                            ) : (
+                              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                            )}
+                            <span className="text-[14px] font-medium text-[#111118] truncate">
+                              {turn.files.length > 0
+                                ? turn.phase === 'complete'
+                                  ? `Built ${turn.files.length} ${turn.files.length === 1 ? 'part' : 'parts'}`
+                                  : `${turn.activeAction} ${formatBuildStepLabel(turn.activeFile)}`
+                                : turn.phaseLabel}
+                            </span>
+                            {turn.activeFile && isTurnWorking ? (
+                              <span className="bg-white rounded-lg px-2 py-0.5 text-[12px] font-mono text-[#18181B] truncate border border-black/[0.05]">
+                                {turn.activeFile}
+                              </span>
+                            ) : null}
+                          </div>
+
+                          <div className="flex items-center gap-2 shrink-0">
+                            {kbLabel && (
+                              <span className="text-[11.5px] font-mono text-[#71717A] tabular-nums">
+                                {kbLabel}
+                              </span>
+                            )}
+                            {turn.files.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={toggleTurnExpanded}
+                                className="text-[13.5px] font-medium text-[#18181B] flex items-center gap-0.5 shrink-0 hover:opacity-75"
+                              >
+                                <span className="tabular-nums">
+                                  All({turn.files.length})
+                                </span>
+                                <ChevronRight
+                                  className={`w-4 h-4 transition-transform duration-150 ${
+                                    isExpanded ? 'rotate-90' : ''
+                                  }`}
+                                />
+                              </button>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Real-Time Build Progress Bar */}
+                        <div className="h-1.5 w-full rounded-full bg-black/[0.07] overflow-hidden">
+                          <div
+                            className="h-full rounded-full transition-all duration-300 ease-out"
+                            style={{
+                              width: `${progressPct}%`,
+                              backgroundColor:
+                                turn.phase === 'complete'
+                                  ? '#16A34A'
+                                  : theme.accentColor,
+                            }}
+                          />
+                        </div>
+
+                        {/* Live Green-Checkmark Checklist + Active Coding Step */}
+                        {isExpanded && (turn.files.length > 0 || isTurnWorking) && (
+                          <ul className="pt-1.5 border-t border-black/[0.06] space-y-1.5 text-[13px]">
+                            {turn.files.map((filePath) => {
+                              const isCurrentlyCoding =
+                                isTurnWorking && filePath === turn.activeFile;
+                              const label = formatBuildStepLabel(filePath);
+                              return (
+                                <li
+                                  key={filePath}
+                                  className="flex items-center justify-between gap-2 py-0.5"
+                                >
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    {isCurrentlyCoding ? (
+                                      <Loader2
+                                        className="w-4 h-4 animate-spin shrink-0"
+                                        style={{ color: theme.accentColor }}
+                                      />
+                                    ) : (
+                                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                                    )}
+                                    <span
+                                      className={`truncate font-medium ${
+                                        isCurrentlyCoding
+                                          ? 'text-[#111118]'
+                                          : 'text-[#18181B]'
+                                      }`}
+                                    >
+                                      {isCurrentlyCoding
+                                        ? `Coding ${label}...`
+                                        : `Built ${label}`}
+                                    </span>
+                                  </div>
+                                  <span className="text-[11.5px] font-mono text-[#71717A] shrink-0 truncate max-w-[130px]">
+                                    {filePath}
+                                  </span>
+                                </li>
+                              );
+                            })}
+
+                            {isTurnWorking && (
+                              <li className="flex items-center gap-2 py-0.5 text-[#52525B]">
+                                <Loader2
+                                  className="w-3.5 h-3.5 animate-spin shrink-0"
+                                  style={{ color: theme.accentColor }}
+                                />
+                                <span className="text-[12.5px] truncate">
+                                  {turn.files.length === 0
+                                    ? 'Thinking & planning real-time app...'
+                                    : 'Thinking & building next feature...'}
+                                </span>
+                              </li>
+                            )}
+                          </ul>
+                        )}
+                      </div>
+                    );
+                  })()}
+
+                  {/* Live Streaming AI Response Prose (Raw code strictly excluded) */}
+                  {turn.errorMessage ? (
+                    <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-[14.5px] text-red-700 leading-relaxed">
+                      {turn.errorMessage}
+                    </div>
+                  ) : (
+                    <div className="flex items-start justify-between gap-2.5">
+                      <div className="flex-1 min-w-0 text-[15.5px] leading-[1.58] tracking-[-0.005em] text-[#111118] whitespace-pre-wrap">
+                        {displayAiText || (
+                          <span className="text-[#71717A]">
+                            {isBuildTurn && turn.phase !== 'understanding'
+                              ? isTurnWorking
+                                ? `Building your real-time ${
+                                    mode === 'mobile'
+                                      ? 'iOS & Android'
+                                      : 'full-stack web'
+                                  } app...`
+                                : 'Your real-time app is ready. Tap Preview to open it.'
+                              : turn.phase === 'understanding'
+                                ? 'Thinking...'
+                                : 'Waiting for response...'}
+                          </span>
+                        )}
+                        {isTurnWorking && displayAiText && (
+                          <span
+                            aria-hidden="true"
+                            className="inline-block w-1.5 h-4 ml-1 align-middle bg-[#7A68F6]/75 rounded-xs"
+                          />
+                        )}
+                      </div>
+
+                      {ttsSupported &&
+                        turn.phase === 'complete' &&
+                        displayAiText.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={() => speakTurn(turn.id, displayAiText)}
+                            aria-label={
+                              speakingTurnId === turn.id
+                                ? 'Replay message from beginning'
+                                : 'Read message aloud'
+                            }
+                            title="Replay audio"
+                            className={`mt-0.5 min-w-[36px] min-h-[36px] rounded-full border flex items-center justify-center shrink-0 transition-all active:scale-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#7A68F6] ${
+                              speakingTurnId === turn.id
+                                ? 'border-transparent text-white shadow-xs'
+                                : 'border-black/10 bg-[#F7F7FA] text-[#52525B] hover:bg-[#EFEFF5] hover:text-[#111118]'
+                            }`}
+                            style={
+                              speakingTurnId === turn.id
+                                ? { backgroundColor: theme.accentColor }
+                                : undefined
+                            }
+                          >
+                            <Volume2 className="w-4 h-4 stroke-[2]" />
+                          </button>
+                        )}
+                    </div>
+                  )}
+
+                  {/* Inline Build Status Card (Shown once building starts) */}
+                  {isBuildTurn &&
+                    (turn.phase === 'building' ||
+                      turn.phase === 'complete' ||
+                      turn.phase === 'error' ||
+                      turn.files.length > 0) && (
+                    <div className="rounded-[20px] border border-black/[0.07] overflow-hidden bg-[#FAFAFC]">
+                      <div className="bg-[#F2F2F6] px-4 py-3 flex items-center justify-between gap-3">
+                        <span className="font-display font-bold text-[15px] text-[#0B0B0F]">
+                          Enabled AI
+                        </span>
+                        <span
+                          className={`px-3.5 py-1 rounded-full text-[13px] font-medium text-white transition-colors duration-300 ${
+                            turn.phase === 'error'
+                              ? 'bg-red-500'
+                              : isTurnWorking
+                                ? 'bg-[#7A68F6]'
+                                : 'bg-[#BFB4FC]'
+                          }`}
+                        >
+                          {turn.phase === 'error'
+                            ? 'Needs attention'
+                            : isTurnWorking
+                              ? 'Building'
+                              : 'Auto-approved'}
+                        </span>
+                      </div>
+
+                      <div className="px-4 py-3.5 space-y-2.5 text-[14px] text-[#52525B]">
+                        <div className="space-y-1.5">
+                          <div className="flex items-center gap-2">
+                            {stepUnderstandingDone ? (
+                              <Check className="w-4 h-4 text-[#6D4AFF] shrink-0" />
+                            ) : (
+                              <Loader2 className="w-4 h-4 text-[#6D4AFF] animate-spin shrink-0" />
+                            )}
+                            <span
+                              className={
+                                stepUnderstandingDone
+                                  ? 'text-[#18181B] font-medium'
+                                  : 'text-[#52525B]'
+                              }
+                            >
+                              Understood {theme.label} requirements
+                            </span>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            {turn.phase === 'error' ? (
+                              <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
+                            ) : stepBuildingDone ? (
+                              <Check className="w-4 h-4 text-[#6D4AFF] shrink-0" />
+                            ) : (
+                              <Loader2 className="w-4 h-4 text-[#6D4AFF] animate-spin shrink-0" />
+                            )}
+                            <span
+                              className={
+                                stepBuildingDone
+                                  ? 'text-[#18181B] font-medium'
+                                  : 'text-[#52525B]'
+                              }
+                            >
+                              {turn.phase === 'error'
+                                ? 'Build paused — retry message below'
+                                : stepBuildingDone
+                                  ? turn.files.length > 0
+                                    ? `Built ${turn.files.length} app ${turn.files.length === 1 ? 'part' : 'parts'}`
+                                    : 'Build complete'
+                                  : turn.files.length > 0
+                                    ? `Building ${turn.activeFile || 'app'}...`
+                                    : 'Building live app stream...'}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="pt-1 flex items-center justify-between gap-2">
+                          <button
+                            type="button"
+                            onClick={onOpenApps}
+                            className="text-[14px] font-medium text-[#6D4AFF] underline underline-offset-4 hover:opacity-80"
+                          >
+                            View in Apps
+                          </button>
+                          {stepBuildingDone && Boolean(turn.previewHtml) ? (
+                            <button
+                              type="button"
+                              onClick={() => onSetView('preview')}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-full bg-[#0B0B0F] text-white text-[12.5px] font-medium hover:bg-black/85 active:scale-95 transition-all"
+                            >
+                              <Eye className="w-3.5 h-3.5" />
+                              <span>Open Preview</span>
+                            </button>
+                          ) : (
+                            <span className="text-xs text-[#71717A]">
+                              {turn.phase === 'error'
+                                ? 'Tap send to retry'
+                                : isTurnWorking
+                                  ? 'Working live'
+                                  : 'Ready for next edit'}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Post-Build One-Tap Follow-Up Suggestions (Auto-Send on Tap) */}
+                  {turn.phase === 'complete' &&
+                    isBuildTurn &&
+                    !turn.errorMessage &&
+                    turn.suggestions &&
+                    turn.suggestions.length > 0 && (
+                      <div className="flex flex-col gap-2 pt-0.5">
+                        <span className="text-[12px] font-semibold uppercase tracking-[0.04em] text-[#71717A] px-0.5">
+                          Tap to add next
+                        </span>
+                        <div className="flex flex-col gap-1.5">
+                          {turn.suggestions.map((suggestion, idx) => (
+                            <button
+                              key={`${turn.id}-sug-${idx}`}
+                              type="button"
+                              disabled={isStreaming}
+                              onClick={() =>
+                                onSendFollowUp(suggestion, {
+                                  reactEnabled: mode === 'web',
+                                  backendEnabled: false,
+                                  webSearchEnabled,
+                                  attachmentName: null,
+                                })
+                              }
+                              className="w-full text-left rounded-xl border border-black/[0.08] bg-white hover:bg-[#F7F7FA] hover:border-black/15 px-3.5 py-2.5 flex items-center justify-between gap-2.5 text-[13.5px] font-medium text-[#111118] transition-all active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              <span className="leading-snug">{suggestion}</span>
+                              <ArrowUpRight
+                                className="w-4 h-4 shrink-0"
+                                style={{ color: theme.accentColor }}
+                              />
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                </article>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Scroll-to-Bottom Button (only when scrolled up) */}
+        {showScrollBottom && (
+          <button
+            type="button"
+            onClick={scrollToBottom}
+            aria-label="Scroll to latest message"
+            className="absolute bottom-3 left-1/2 -translate-x-1/2 w-10 h-10 rounded-full bg-white border border-black/10 shadow-md flex items-center justify-center text-[#0B0B0F] hover:bg-neutral-50 active:scale-95 transition-all"
+          >
+            <ArrowDown className="w-5 h-5" />
+          </button>
+        )}
+      </div>
+
+      {/* Bottom Follow-Up Chat Composer */}
+      <div className="shrink-0 w-full bg-white border-t border-black/[0.05] pb-safe">
+        <div className="w-full max-w-[520px] mx-auto px-4 pt-2 pb-2.5">
+          {/* Micro Status Strip above Composer */}
+          <div className="px-1 pb-2 flex items-center justify-between text-[13.5px]">
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={onOpenUpgrade}
+                aria-label={`AI Craft credits: ${credits}. Tap to upgrade or add credits`}
+                className="flex items-center gap-1.5 rounded-full px-1.5 py-1 -ml-1.5 hover:bg-black/[0.04] active:scale-95 transition-all"
+              >
+                <span
+                  className="w-[18px] h-[18px] rounded-full flex items-center justify-center shrink-0"
+                  style={{
+                    background:
+                      mode === 'mobile'
+                        ? 'linear-gradient(135deg, #C4B5FD 0%, #7A68F6 60%, #5B21B6 100%)'
+                        : 'linear-gradient(135deg, #F0ABFC 0%, #8B5CF6 60%, #6D28D9 100%)',
+                  }}
+                  aria-hidden="true"
+                >
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none">
+                    <path
+                      d="M14.5 9.5L12 16L9.5 14.5L12 8L14.5 9.5Z"
+                      fill="white"
+                      fillOpacity="0.95"
+                    />
+                  </svg>
+                </span>
+                <span className="font-display font-semibold text-[#111118] tabular-nums">
+                  {credits}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setAutoAllow((v) => !v)}
+                className="flex items-center gap-1 text-[#52525B] hover:text-[#0B0B0F] font-medium"
+              >
+                <span>{autoAllow ? 'Always allow' : 'Ask first'}</span>
+                <ChevronDown className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={onOpenSettings}
+                className="flex items-center gap-1 text-[#52525B] hover:text-[#0B0B0F] font-medium"
+              >
+                <HelpCircle className="w-3.5 h-3.5" />
+                <span>AI</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={onOpenUpgrade}
+                className="font-semibold text-[#0D5BFF] hover:opacity-80"
+              >
+                Upgrade
+              </button>
+            </div>
+          </div>
+
+          {/* Rounded Input Card */}
+          <div className="relative w-full rounded-[22px] bg-white border border-black/[0.09] shadow-[0_4px_20px_rgba(15,15,30,0.04)] px-4 pt-2.5 pb-2.5 flex flex-col gap-1.5">
+            {/* Selected AI Header Bar at the top of the chat box */}
+            <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-black/[0.05]">
+              <div className="flex items-center gap-2 min-w-0">
+                <ProviderLogo
+                  provider={activeModel?.provider}
+                  modelId={activeModel?.id || selectedModel}
+                  size={20}
+                  isTracking={isStreaming}
+                  trackingColor={theme.accentColor}
+                />
+                <span className="text-[12.5px] font-medium text-[#18181B] truncate">
+                  {activeModel?.name ??
+                    (modelsLoading
+                      ? 'Connecting AI...'
+                      : selectedModel || 'Select AI')}
+                </span>
+              </div>
+
+              <div className="-mr-1 shrink-0">
+                <ModelSelectorPopover
+                  mode={mode}
+                  models={models}
+                  selectedModel={selectedModel}
+                  modelsLoading={modelsLoading}
+                  modelsError={modelsError}
+                  isStreaming={isStreaming}
+                  onSelectModel={onSelectModel}
+                  onRetryModels={onRetryModels}
+                />
+              </div>
+            </div>
+
+            <div className="flex items-start gap-2">
+              <textarea
+                value={followUp}
+                onChange={(e) => setFollowUp(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder={
+                  isVoiceListening
+                    ? 'Listening... speak now'
+                    : isVoiceTranscribing
+                      ? 'Transcribing speech...'
+                      : mode === 'mobile'
+                        ? 'Ask or describe your mobile app...'
+                        : 'Ask or describe your web app...'
+                }
+                rows={2}
+                aria-label="Send message or follow-up to AI Craft"
+                className="flex-1 min-w-0 resize-none bg-transparent text-[15px] leading-[1.45] text-[#0B0B0F] placeholder:text-[#A1A1AA] focus:outline-none min-h-[44px]"
+              />
+              <div className="pt-0.5 shrink-0">
+                <VoiceInputButton
+                  variant="inline"
+                  status={voiceStatus}
+                  voiceLevel={voiceLevel}
+                  accentColor={theme.accentColor}
+                  disabled={isStreaming}
+                  onClick={toggleVoice}
+                />
+              </div>
+            </div>
+
+            {voiceError && (
+              <p className="text-[11.5px] text-red-600">{voiceError}</p>
+            )}
+
+            {attachment && (
+              <div className="flex items-center gap-2 text-xs text-[#52525B]">
+                {attachment.dataUrl ? (
+                  <img
+                    src={attachment.dataUrl}
+                    alt={attachment.name}
+                    className="w-9 h-9 rounded-lg object-cover border border-black/10 shrink-0"
+                  />
+                ) : null}
+                <span className="truncate max-w-[220px] font-medium">
+                  {attachment.name}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setAttachment(null)}
+                  aria-label="Remove attachment"
+                  className="p-0.5 rounded-full hover:bg-black/5 text-[#71717A]"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            )}
+
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className="hidden"
+                  onChange={handleFileChange}
+                  accept="image/*,.pdf,.txt,.json"
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  aria-label="Attach screenshot or file"
+                  className="w-9 h-9 rounded-full border border-black/[0.09] flex items-center justify-center text-[#3F3F46] hover:bg-black/[0.03] active:scale-95 transition-all"
+                >
+                  <Paperclip className="w-[17px] h-[17px] -rotate-45 stroke-[1.8]" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setWebSearchEnabled((v) => !v)}
+                  aria-pressed={webSearchEnabled}
+                  aria-label="Toggle live browser web search"
+                  title={webSearchEnabled ? 'Browser search connected' : 'Browser search off'}
+                  className={`w-9 h-9 rounded-full border flex items-center justify-center active:scale-95 transition-all ${
+                    webSearchEnabled
+                      ? 'border-[#7A68F6]/45 bg-[#F3F0FF] text-[#6D4AFF]'
+                      : 'border-black/[0.09] text-[#52525B] hover:bg-black/[0.03]'
+                  }`}
+                >
+                  <Globe className="w-[17px] h-[17px] stroke-[1.75]" />
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleSubmit}
+                disabled={!hasContent || isStreaming}
+                aria-label="Send message to AI Craft"
+                style={{
+                  backgroundColor:
+                    hasContent && !isStreaming ? theme.sendActiveBg : '#BEB5F9',
+                }}
+                className="w-9 h-9 rounded-full flex items-center justify-center text-white transition-all duration-200 active:scale-95 disabled:cursor-default"
+              >
+                {isStreaming ? (
+                  <Loader2 className="w-[17px] h-[17px] animate-spin" />
+                ) : (
+                  <ArrowUp className="w-[18px] h-[18px] stroke-[2.4]" />
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
