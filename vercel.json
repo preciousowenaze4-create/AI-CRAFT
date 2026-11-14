@@ -18,6 +18,10 @@
   ],
   "rewrites": [
     {
+      "source": "/api/auth/(.*)",
+      "destination": "/api/auth?__route=$1"
+    },
+    {
       "source": "/api/:match*",
       "destination": "/api/:match*"
     },
