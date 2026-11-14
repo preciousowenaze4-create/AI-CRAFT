@@ -1308,7 +1308,7 @@ export default function App() {
         onOpenInstallGuide={() => setActiveTab('setting')}
       />
 
-      {/* Live 3D Blinking Head — positioned strictly in the top-left circled space without altering layout */}
+      {/* Live 3D Blinking Head — centered at the top middle without altering layout */}
       <div
         aria-hidden={activeTab !== 'create'}
         className={`pointer-events-none absolute inset-x-0 top-0 z-[25] max-w-[540px] mx-auto transition-opacity duration-200 ${
@@ -1316,12 +1316,13 @@ export default function App() {
         }`}
       >
         <div
-          className="pointer-events-auto absolute"
+          className="pointer-events-none absolute"
           style={{
-            top: 'max(4px, env(safe-area-inset-top))',
-            left: 'clamp(58px, 16vw, 76px)',
-            width: 'clamp(114px, 31vw, 134px)',
-            height: 'clamp(114px, 31vw, 134px)',
+            top: 'calc(max(6px, env(safe-area-inset-top)) + 2px)',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            width: 'clamp(86px, 23vw, 98px)',
+            height: 'clamp(86px, 23vw, 98px)',
           }}
         >
           <Head3DOverlay active={activeTab === 'create'} />

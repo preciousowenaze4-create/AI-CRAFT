@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
@@ -43,12 +42,13 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
 
     THREE.Cache.enabled = true;
 
-    const width = Math.max(container.clientWidth, 120);
-    const height = Math.max(container.clientHeight, 120);
+    const width = Math.max(container.clientWidth, 86);
+    const height = Math.max(container.clientHeight, 86);
 
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(34, width / height, 0.1, 100);
-    camera.position.set(0, 0.05, 3.15);
+    camera.position.set(0, 0, 3.15);
+    camera.lookAt(0, 0, 0);
 
     const renderer = new THREE.WebGLRenderer({
       antialias: !isSoftwareGl,
@@ -66,10 +66,9 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
     renderer.domElement.style.width = '100%';
     renderer.domElement.style.height = '100%';
     renderer.domElement.style.display = 'block';
-    renderer.domElement.style.touchAction = 'none';
     container.appendChild(renderer.domElement);
 
-    // Studio IBL environment so the metallic dark-blue head contour catches highlights
+    // Studio IBL environment so the metallic dark-blue head catches crisp contour highlights
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
     const envTarget = pmremGenerator.fromScene(new RoomEnvironment(), 0.04);
     scene.environment = envTarget.texture;
@@ -91,39 +90,10 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
     rimLight.position.set(0, 2.2, -3.0);
     scene.add(rimLight);
 
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableZoom = false;
-    controls.enablePan = false;
-    controls.enableDamping = !isSoftwareGl;
-    controls.dampingFactor = 0.08;
-    controls.rotateSpeed = 0.75;
-    controls.minPolarAngle = Math.PI * 0.25;
-    controls.maxPolarAngle = Math.PI * 0.75;
-
     const headPivot = new THREE.Group();
     scene.add(headPivot);
 
     let mixer: THREE.AnimationMixer | null = null;
-    let isDragging = false;
-    let lastInteractionAt = 0;
-    let tapPulse = 0;
-
-    const onControlStart = () => {
-      isDragging = true;
-      lastInteractionAt = performance.now();
-    };
-    const onControlEnd = () => {
-      isDragging = false;
-      lastInteractionAt = performance.now();
-    };
-    const onPointerDown = () => {
-      tapPulse = 1;
-      lastInteractionAt = performance.now();
-    };
-
-    controls.addEventListener('start', onControlStart);
-    controls.addEventListener('end', onControlEnd);
-    renderer.domElement.addEventListener('pointerdown', onPointerDown);
 
     const loader = new GLTFLoader();
     loader.load(
@@ -138,7 +108,7 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
         const center = box.getCenter(new THREE.Vector3());
         const size = box.getSize(new THREE.Vector3());
         const maxDim = Math.max(size.x, size.y, size.z) || 1;
-        const targetScale = 1.58 / maxDim;
+        const targetScale = 1.66 / maxDim;
 
         model.scale.setScalar(targetScale);
         model.position.set(
@@ -185,8 +155,8 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
 
     const handleResize = () => {
       if (disposed || !container) return;
-      const w = Math.max(container.clientWidth, 120);
-      const h = Math.max(container.clientHeight, 120);
+      const w = Math.max(container.clientWidth, 86);
+      const h = Math.max(container.clientHeight, 86);
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
@@ -196,7 +166,6 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
     resizeObserver.observe(container);
 
     const clock = new THREE.Clock();
-    const defaultCameraPos = new THREE.Vector3(0, 0.05, 3.15);
 
     function afterDraw(cb: () => void) {
       const gl = renderer.getContext() as WebGL2RenderingContext | null;
@@ -226,42 +195,13 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
       if (disposed) return;
 
       const delta = Math.min(clock.getDelta(), 0.1);
-      const elapsed = clock.elapsedTime;
 
       if (activeRef.current) {
         if (mixer) {
           mixer.update(delta);
         }
 
-        // Gentle organic idle breathing & responsive tap pulse
-        tapPulse = THREE.MathUtils.damp(tapPulse, 0, 7, delta);
-        headPivot.position.y = Math.sin(elapsed * 1.4) * 0.025 + tapPulse * 0.035;
-        headPivot.rotation.y = Math.sin(elapsed * 0.9) * 0.09;
-        headPivot.rotation.x = Math.sin(elapsed * 1.15) * 0.03 - tapPulse * 0.08;
-
-        // Smoothly glide camera back toward hero front pose after dragging
-        if (!isDragging && performance.now() - lastInteractionAt > 2400) {
-          camera.position.x = THREE.MathUtils.damp(
-            camera.position.x,
-            defaultCameraPos.x,
-            2.2,
-            delta,
-          );
-          camera.position.y = THREE.MathUtils.damp(
-            camera.position.y,
-            defaultCameraPos.y,
-            2.2,
-            delta,
-          );
-          camera.position.z = THREE.MathUtils.damp(
-            camera.position.z,
-            defaultCameraPos.z,
-            2.2,
-            delta,
-          );
-        }
-
-        controls.update();
+        // Keep head strictly facing straight forward with zero spin/rotation
         renderer.render(scene, camera);
       }
 
@@ -283,10 +223,6 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       resizeObserver.disconnect();
-      controls.removeEventListener('start', onControlStart);
-      controls.removeEventListener('end', onControlEnd);
-      renderer.domElement.removeEventListener('pointerdown', onPointerDown);
-      controls.dispose();
 
       if (mixer) {
         mixer.stopAllAction();
@@ -312,8 +248,8 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
     <div
       ref={containerRef}
       role="img"
-      aria-label="Interactive animated 3D blinking head"
-      className={`w-full h-full cursor-grab active:cursor-grabbing transition-opacity duration-300 ${
+      aria-label="Animated 3D blinking head"
+      className={`w-full h-full pointer-events-none transition-opacity duration-300 ${
         loaded ? 'opacity-100' : 'opacity-0'
       }`}
     />
