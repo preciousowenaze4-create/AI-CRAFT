@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'motion/react';
 import { ArrowRight, ChevronRight, Loader2, Plus } from 'lucide-react';
+import {
+  AuthScreen,
+  AuthViewMode,
+  STORAGE_SB_RECOVERY_KEY,
+  STORAGE_SB_SESSION_KEY,
+  StoredSupabaseSession,
+} from './components/AuthScreen';
 import { BottomNav } from './components/BottomNav';
 import { BuilderWorkspace } from './components/BuilderWorkspace';
 import { Head3DOverlay } from './components/Head3DOverlay';
@@ -17,6 +24,7 @@ import { PromptComposer } from './components/PromptComposer';
 import { TopBar } from './components/TopBar';
 import { unlockSpeechSynthesis } from './hooks/useSpeechNarration';
 import {
+  AuthUser,
   BuildMode,
   BuilderTurn,
   ComposerOptions,
@@ -170,7 +178,28 @@ function loadSavedBoolean(key: string, defaultValue: boolean): boolean {
   return defaultValue;
 }
 
+function loadStoredJson<T>(key: string): T | null {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return null;
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
 export default function App() {
+  const [recoveryTokens, setRecoveryTokens] = useState<StoredSupabaseSession | null>(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('auth_recovery') === '1') {
+      return loadStoredJson<StoredSupabaseSession>(STORAGE_SB_RECOVERY_KEY);
+    }
+    return null;
+  });
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authChecking, setAuthChecking] = useState<boolean>(() =>
+    Boolean(loadStoredJson<StoredSupabaseSession>(STORAGE_SB_SESSION_KEY))
+  );
   const [mode, setMode] = useState<BuildMode>('mobile');
   const [activeTab, setActiveTab] = useState<NavTab>('create');
   const [viewMode, setViewMode] = useState<'home' | 'builder'>('home');
@@ -222,9 +251,82 @@ export default function App() {
     projects.find((p) => p.id === activeProjectId) ?? null;
   const activeProjectIsStreaming = isProjectWorking(activeProject);
 
+  // Verify any existing Supabase session via backend on startup
+  useEffect(() => {
+    let cancelled = false;
+    const storedSession = loadStoredJson<StoredSupabaseSession>(STORAGE_SB_SESSION_KEY);
+
+    const checkSession = async () => {
+      try {
+        const headers: Record<string, string> = {};
+        if (storedSession?.accessToken) {
+          headers.Authorization = `Bearer ${storedSession.accessToken}`;
+        }
+        if (storedSession?.refreshToken) {
+          headers['x-refresh-token'] = storedSession.refreshToken;
+        }
+        const res = await fetch('/api/auth/me', { headers });
+        const data = (await res.json()) as {
+          authenticated?: boolean;
+          user?: AuthUser | null;
+          accessToken?: string;
+          refreshToken?: string;
+        };
+        if (cancelled) return;
+
+        if (data.authenticated && data.user) {
+          setAuthUser(data.user);
+          if (data.accessToken) {
+            try {
+              window.localStorage.setItem(
+                STORAGE_SB_SESSION_KEY,
+                JSON.stringify({
+                  accessToken: data.accessToken,
+                  refreshToken: data.refreshToken || storedSession?.refreshToken,
+                })
+              );
+            } catch {
+              // ignore storage error
+            }
+          }
+          setUserProfile((prev) => ({
+            name: data.user!.name || prev.name,
+            email: data.user!.email || prev.email,
+            avatarDataUrl: prev.avatarDataUrl || data.user!.avatarUrl || null,
+          }));
+        } else if (storedSession) {
+          try {
+            window.localStorage.removeItem(STORAGE_SB_SESSION_KEY);
+          } catch {
+            // ignore storage error
+          }
+        }
+      } catch {
+        // leave unauthenticated if backend unreachable
+      } finally {
+        if (!cancelled) {
+          setAuthChecking(false);
+        }
+      }
+    };
+
+    void checkSession();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // Real-time dynamic mobile browser theme-color update
   useEffect(() => {
     const existingMeta = document.querySelector<HTMLMetaElement>('meta[name="theme-color"]');
+
+    if (!authUser) {
+      const meta = existingMeta ?? document.createElement('meta');
+      meta.name = 'theme-color';
+      meta.content = '#FFFFFF';
+      if (!existingMeta) document.head.appendChild(meta);
+      return;
+    }
 
     if (showProUpgrade) {
       const meta = existingMeta ?? document.createElement('meta');
@@ -251,7 +353,7 @@ export default function App() {
       meta.content = dynamicColorEnabled ? theme.themeColor : '#FFFFFF';
       if (!existingMeta) document.head.appendChild(meta);
     }
-  }, [theme.themeColor, dynamicColorEnabled, viewMode, activeProject, projectViews, showProUpgrade]);
+  }, [authUser, theme.themeColor, dynamicColorEnabled, viewMode, activeProject, projectViews, showProUpgrade]);
 
   useEffect(() => {
     try {
@@ -1217,70 +1319,154 @@ export default function App() {
     />
   );
 
-  if (viewMode === 'builder' && activeProject) {
-    const activeWorkspaceView: WorkspaceView =
-      projectViews[activeProject.id] ?? 'chat';
+  const handleAuthenticated = useCallback(
+    (user: AuthUser, session: StoredSupabaseSession) => {
+      setAuthUser(user);
+      setAuthChecking(false);
+      setRecoveryTokens(null);
+      try {
+        window.localStorage.setItem(STORAGE_SB_SESSION_KEY, JSON.stringify(session));
+        if (window.location.search.includes('auth_recovery=')) {
+          window.history.replaceState({}, '', '/');
+        }
+      } catch {
+        // ignore storage error
+      }
+      setUserProfile((prev) => ({
+        name: user.name || prev.name,
+        email: user.email || prev.email,
+        avatarDataUrl: prev.avatarDataUrl || user.avatarUrl || null,
+      }));
+    },
+    []
+  );
 
-    return (
-      <>
-        {activeWorkspaceView !== 'preview' && <OfflineIndicator />}
-        <BuilderWorkspace
-          projectId={activeProject.id}
-          projectTitle={activeProject.title}
-          mode={activeProject.mode}
-          credits={credits}
-          turns={activeProject.turns}
-          isStreaming={activeProjectIsStreaming}
-          activeView={activeWorkspaceView}
-          isPublished={Boolean(publishedProjects[activeProject.id])}
-          models={models}
-          selectedModel={selectedModel}
-          modelsLoading={modelsLoading}
-          modelsError={modelsError}
-          onSelectModel={setSelectedModel}
-          onRetryModels={() => void loadModels(true)}
-          onSetView={(view) => {
-            setProjectViews((prev) => ({
-              ...prev,
-              [activeProject.id]: view,
-            }));
-          }}
-          onPublish={() => {
-            setPublishedProjects((prev) => ({
-              ...prev,
-              [activeProject.id]: true,
-            }));
-          }}
-          onBack={() => {
-            if (activeWorkspaceView !== 'chat') {
-              setProjectViews((prev) => ({
-                ...prev,
-                [activeProject.id]: 'chat',
-              }));
-            } else {
-              setViewMode('home');
-              setActiveTab('create');
-            }
-          }}
-          onSendFollowUp={handleFollowUp}
-          onOpenApps={() => {
-            setViewMode('home');
-            setActiveTab('apps');
-          }}
-          onOpenSettings={() => {
-            setViewMode('home');
-            setActiveTab('setting');
-          }}
-          onOpenUpgrade={() => setShowProUpgrade(true)}
-          autoReadEnabled={autoReadEnabled}
-        />
-        {proModalElement}
-      </>
-    );
-  }
+  const handleSignOut = useCallback(async () => {
+    const stored = loadStoredJson<StoredSupabaseSession>(STORAGE_SB_SESSION_KEY);
+    try {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: stored?.accessToken
+          ? { Authorization: `Bearer ${stored.accessToken}` }
+          : undefined,
+      });
+    } catch {
+      // ignore network error on sign out
+    }
+    try {
+      window.localStorage.removeItem(STORAGE_SB_SESSION_KEY);
+    } catch {
+      // ignore storage error
+    }
+    setShowProUpgrade(false);
+    setViewMode('home');
+    setActiveTab('create');
+    setAuthUser(null);
+  }, []);
+
+  const isBuilderOpen = viewMode === 'builder' && Boolean(activeProject);
+  const showHead3D =
+    Boolean(authUser) && !isBuilderOpen && activeTab === 'create' && !showProUpgrade;
+  const activeWorkspaceView: WorkspaceView = activeProject
+    ? (projectViews[activeProject.id] ?? 'chat')
+    : 'chat';
+
+  const headOverlayElement = (
+    <div
+      aria-hidden={!showHead3D}
+      className={`pointer-events-none fixed inset-x-0 top-0 z-[35] max-w-[540px] mx-auto ${
+        showHead3D ? 'opacity-100 visible' : 'opacity-0 invisible'
+      }`}
+    >
+      <div
+        className="pointer-events-none absolute"
+        style={{
+          top: 'calc(max(6px, env(safe-area-inset-top)) + 2px)',
+          left: '50%',
+          transform: 'translateX(-50%)',
+          width: 'clamp(86px, 23vw, 98px)',
+          height: 'clamp(86px, 23vw, 98px)',
+        }}
+      >
+        <Head3DOverlay active={showHead3D} />
+      </div>
+    </div>
+  );
+
+  const initialAuthView: AuthViewMode = recoveryTokens ? 'recovery' : 'welcome';
 
   return (
-    <div className="fixed inset-0 h-dvh w-full flex flex-col justify-between bg-white overflow-hidden overscroll-none select-none sm:select-auto">
+    <>
+      {authChecking ? (
+        <div className="fixed inset-0 h-dvh w-full bg-white flex flex-col items-center justify-center gap-3 overflow-hidden">
+          <img
+            src="/logo-mark.png"
+            alt="AI Craft"
+            className="w-14 h-14 object-contain animate-pulse"
+          />
+        </div>
+      ) : !authUser ? (
+        <AuthScreen
+          initialView={initialAuthView}
+          recoveryTokens={recoveryTokens}
+          onAuthenticated={handleAuthenticated}
+        />
+      ) : viewMode === 'builder' && activeProject ? (
+        <>
+          {activeWorkspaceView !== 'preview' && <OfflineIndicator />}
+          <BuilderWorkspace
+            projectId={activeProject.id}
+            projectTitle={activeProject.title}
+            mode={activeProject.mode}
+            credits={credits}
+            turns={activeProject.turns}
+            isStreaming={activeProjectIsStreaming}
+            activeView={activeWorkspaceView}
+            isPublished={Boolean(publishedProjects[activeProject.id])}
+            models={models}
+            selectedModel={selectedModel}
+            modelsLoading={modelsLoading}
+            modelsError={modelsError}
+            onSelectModel={setSelectedModel}
+            onRetryModels={() => void loadModels(true)}
+            onSetView={(view) => {
+              setProjectViews((prev) => ({
+                ...prev,
+                [activeProject.id]: view,
+              }));
+            }}
+            onPublish={() => {
+              setPublishedProjects((prev) => ({
+                ...prev,
+                [activeProject.id]: true,
+              }));
+            }}
+            onBack={() => {
+              if (activeWorkspaceView !== 'chat') {
+                setProjectViews((prev) => ({
+                  ...prev,
+                  [activeProject.id]: 'chat',
+                }));
+              } else {
+                setViewMode('home');
+                setActiveTab('create');
+              }
+            }}
+            onSendFollowUp={handleFollowUp}
+            onOpenApps={() => {
+              setViewMode('home');
+              setActiveTab('apps');
+            }}
+            onOpenSettings={() => {
+              setViewMode('home');
+              setActiveTab('setting');
+            }}
+            onOpenUpgrade={() => setShowProUpgrade(true)}
+            autoReadEnabled={autoReadEnabled}
+          />
+        </>
+      ) : (
+        <div className="fixed inset-0 h-dvh w-full flex flex-col justify-between bg-white overflow-hidden overscroll-none select-none sm:select-auto">
       {/* Full-Bleed Real-Time Dynamic Top Ambient Color Wash */}
       <div
         aria-hidden="true"
@@ -1307,27 +1493,6 @@ export default function App() {
         onAvatarClick={() => setActiveTab('setting')}
         onOpenInstallGuide={() => setActiveTab('setting')}
       />
-
-      {/* Live 3D Blinking Head — centered at the top middle without altering layout */}
-      <div
-        aria-hidden={activeTab !== 'create'}
-        className={`pointer-events-none absolute inset-x-0 top-0 z-[25] max-w-[540px] mx-auto transition-opacity duration-200 ${
-          activeTab === 'create' ? 'opacity-100 visible' : 'opacity-0 invisible'
-        }`}
-      >
-        <div
-          className="pointer-events-none absolute"
-          style={{
-            top: 'calc(max(6px, env(safe-area-inset-top)) + 2px)',
-            left: '50%',
-            transform: 'translateX(-50%)',
-            width: 'clamp(86px, 23vw, 98px)',
-            height: 'clamp(86px, 23vw, 98px)',
-          }}
-        >
-          <Head3DOverlay active={activeTab === 'create'} />
-        </div>
-      </div>
 
       {/* Main Content Area — Strictly Single Screen, No Overlapping Screens */}
       <main className="relative z-10 flex-1 min-h-0 w-full flex flex-col">
@@ -1548,6 +1713,7 @@ export default function App() {
                   setPublishedProjects({});
                 }}
                 onBackToCreate={() => setActiveTab('create')}
+                onSignOut={() => void handleSignOut()}
               />
             </motion.section>
           )}
@@ -1556,8 +1722,10 @@ export default function App() {
 
       {/* Bottom Tab Bar */}
       <BottomNav activeTab={activeTab} onChange={setActiveTab} />
-
+        </div>
+      )}
+      {headOverlayElement}
       {proModalElement}
-    </div>
+    </>
   );
 }

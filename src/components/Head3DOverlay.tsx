@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import * as THREE from 'three';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { GLTF, GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 interface Head3DOverlayProps {
   active: boolean;
@@ -9,13 +9,103 @@ interface Head3DOverlayProps {
 
 const MODEL_URL = '/psichedelic_abstract_geometry_loop_animation.glb';
 
+// Eager module-level preload & parse cache so the 3D blinking head downloads immediately
+// on first open and stays resident across all view transitions.
+let cachedGltfPromise: Promise<GLTF> | null = null;
+let cachedGltfResolved: GLTF | null = null;
+
+function prepareLoadedHeadGltf(gltf: GLTF): GLTF {
+  const model = gltf.scene;
+  model.updateMatrixWorld(true);
+
+  const box = new THREE.Box3().setFromObject(model);
+  const center = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const targetScale = 1.66 / maxDim;
+
+  model.scale.setScalar(targetScale);
+  model.position.set(
+    -center.x * targetScale,
+    -center.y * targetScale,
+    -center.z * targetScale,
+  );
+
+  model.traverse((child) => {
+    if (child instanceof THREE.Mesh) {
+      child.frustumCulled = false;
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach((mat) => {
+        if (mat && 'envMapIntensity' in mat) {
+          (mat as THREE.MeshStandardMaterial).envMapIntensity = 1.35;
+        }
+      });
+    }
+  });
+
+  cachedGltfResolved = gltf;
+  return gltf;
+}
+
+function getPreloadedHeadGltf(): Promise<GLTF> {
+  if (cachedGltfResolved) {
+    return Promise.resolve(cachedGltfResolved);
+  }
+  if (!cachedGltfPromise) {
+    cachedGltfPromise = fetch(MODEL_URL)
+      .then((res) => {
+        if (!res.ok) {
+          throw new Error(`Failed to fetch GLB (${res.status})`);
+        }
+        return res.arrayBuffer();
+      })
+      .then(
+        (buffer) =>
+          new Promise<GLTF>((resolve, reject) => {
+            const loader = new GLTFLoader();
+            loader.parse(
+              buffer,
+              '/',
+              (gltf) => resolve(prepareLoadedHeadGltf(gltf)),
+              reject,
+            );
+          }),
+      )
+      .catch(
+        () =>
+          new Promise<GLTF>((resolve, reject) => {
+            const loader = new GLTFLoader();
+            loader.load(
+              MODEL_URL,
+              (gltf) => resolve(prepareLoadedHeadGltf(gltf)),
+              undefined,
+              reject,
+            );
+          }),
+      )
+      .catch((err) => {
+        cachedGltfPromise = null;
+        throw err;
+      });
+  }
+  return cachedGltfPromise;
+}
+
+// Kick off preload immediately on module evaluation
+if (typeof window !== 'undefined') {
+  void getPreloadedHeadGltf();
+}
+
 export function Head3DOverlay({ active }: Head3DOverlayProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const activeRef = useRef(active);
-  const [loaded, setLoaded] = useState(false);
+  const renderImmediateRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     activeRef.current = active;
+    if (active) {
+      renderImmediateRef.current?.();
+    }
   }, [active]);
 
   useEffect(() => {
@@ -24,21 +114,6 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
 
     let disposed = false;
     let frameId = 0;
-
-    // Detect software WebGL once cleanly without altering visual design
-    const isSoftwareGl = (() => {
-      try {
-        const probe = document.createElement('canvas').getContext('webgl2');
-        if (!probe) return true;
-        const ext = probe.getExtension('WEBGL_debug_renderer_info');
-        const param = ext ? ext.UNMASKED_RENDERER_WEBGL : probe.RENDERER;
-        const gpu = String(probe.getParameter(param) || '');
-        probe.getExtension('WEBGL_lose_context')?.loseContext();
-        return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
-      } catch {
-        return true;
-      }
-    })();
 
     THREE.Cache.enabled = true;
 
@@ -51,10 +126,23 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
     camera.lookAt(0, 0, 0);
 
     const renderer = new THREE.WebGLRenderer({
-      antialias: !isSoftwareGl,
+      antialias: true,
       alpha: true,
       powerPreference: 'high-performance',
     });
+
+    const isSoftwareGl = (() => {
+      try {
+        const gl = renderer.getContext();
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+        const gpu = String(gl.getParameter(param) || '');
+        return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+      } catch {
+        return false;
+      }
+    })();
+
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.25;
@@ -94,64 +182,46 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
     scene.add(headPivot);
 
     let mixer: THREE.AnimationMixer | null = null;
+    const animOriginMs = performance.now();
+    let clipDuration = 4.1666665;
+    let lastDrawMs = performance.now();
 
-    const loader = new GLTFLoader();
-    loader.load(
-      MODEL_URL,
-      (gltf) => {
+    renderImmediateRef.current = () => {
+      if (disposed) return;
+      if (mixer) {
+        const elapsedSec = ((performance.now() - animOriginMs) / 1000) % clipDuration;
+        mixer.setTime(elapsedSec);
+      }
+      renderer.render(scene, camera);
+    };
+
+    getPreloadedHeadGltf()
+      .then((gltf) => {
         if (disposed) return;
 
         const model = gltf.scene;
-        model.updateMatrixWorld(true);
-
-        const box = new THREE.Box3().setFromObject(model);
-        const center = box.getCenter(new THREE.Vector3());
-        const size = box.getSize(new THREE.Vector3());
-        const maxDim = Math.max(size.x, size.y, size.z) || 1;
-        const targetScale = 1.66 / maxDim;
-
-        model.scale.setScalar(targetScale);
-        model.position.set(
-          -center.x * targetScale,
-          -center.y * targetScale,
-          -center.z * targetScale,
-        );
-
-        model.traverse((child) => {
-          if (child instanceof THREE.Mesh) {
-            child.frustumCulled = false;
-            const mats = Array.isArray(child.material)
-              ? child.material
-              : [child.material];
-            mats.forEach((mat) => {
-              if (mat && 'envMapIntensity' in mat) {
-                (mat as THREE.MeshStandardMaterial).envMapIntensity = 1.35;
-              }
-            });
-          }
-        });
-
         headPivot.add(model);
 
         if (gltf.animations && gltf.animations.length > 0) {
           mixer = new THREE.AnimationMixer(model);
+          clipDuration = gltf.animations[0].duration || 4.1666665;
           gltf.animations.forEach((clip) => {
             const action = mixer!.clipAction(clip);
             action.setLoop(THREE.LoopRepeat, Infinity);
             action.play();
           });
+          const elapsedSec = ((performance.now() - animOriginMs) / 1000) % clipDuration;
+          mixer.setTime(elapsedSec);
         }
 
         if (!isSoftwareGl) {
           renderer.compile(scene, camera);
         }
-        setLoaded(true);
-      },
-      undefined,
-      (err) => {
+        renderer.render(scene, camera);
+      })
+      .catch((err) => {
         console.error('Failed to load 3D head GLB:', err);
-      },
-    );
+      });
 
     const handleResize = () => {
       if (disposed || !container) return;
@@ -160,12 +230,27 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
       camera.aspect = w / h;
       camera.updateProjectionMatrix();
       renderer.setSize(w, h);
+      if (activeRef.current) {
+        renderer.render(scene, camera);
+      }
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && !disposed) {
+        lastDrawMs = performance.now();
+        if (mixer) {
+          const elapsedSec = ((performance.now() - animOriginMs) / 1000) % clipDuration;
+          mixer.setTime(elapsedSec);
+        }
+        if (activeRef.current) {
+          renderer.render(scene, camera);
+        }
+      }
     };
 
     const resizeObserver = new ResizeObserver(handleResize);
     resizeObserver.observe(container);
-
-    const clock = new THREE.Clock();
+    document.addEventListener('visibilitychange', handleVisibility);
 
     function afterDraw(cb: () => void) {
       const gl = renderer.getContext() as WebGL2RenderingContext | null;
@@ -194,14 +279,16 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
     function tick() {
       if (disposed) return;
 
-      const delta = Math.min(clock.getDelta(), 0.1);
+      const now = performance.now();
+      const delta = Math.min(Math.max((now - lastDrawMs) / 1000, 0), 0.1);
+      lastDrawMs = now;
+
+      // Always keep the blinking animation timeline running continuously even when away
+      if (mixer) {
+        mixer.update(delta);
+      }
 
       if (activeRef.current) {
-        if (mixer) {
-          mixer.update(delta);
-        }
-
-        // Keep head strictly facing straight forward with zero spin/rotation
         renderer.render(scene, camera);
       }
 
@@ -220,22 +307,17 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
 
     return () => {
       disposed = true;
+      renderImmediateRef.current = null;
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
       resizeObserver.disconnect();
+      document.removeEventListener('visibilitychange', handleVisibility);
 
       if (mixer) {
         mixer.stopAllAction();
       }
 
-      scene.traverse((obj) => {
-        if (obj instanceof THREE.Mesh) {
-          obj.geometry?.dispose();
-          const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
-          mats.forEach((m) => m?.dispose());
-        }
-      });
-
+      headPivot.clear();
       envTarget.dispose();
       renderer.dispose();
       if (renderer.domElement.parentNode === container) {
@@ -249,9 +331,7 @@ export function Head3DOverlay({ active }: Head3DOverlayProps) {
       ref={containerRef}
       role="img"
       aria-label="Animated 3D blinking head"
-      className={`w-full h-full pointer-events-none transition-opacity duration-300 ${
-        loaded ? 'opacity-100' : 'opacity-0'
-      }`}
+      className="w-full h-full pointer-events-none"
     />
   );
 }

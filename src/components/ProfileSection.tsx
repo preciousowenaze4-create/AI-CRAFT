@@ -4,6 +4,7 @@ import {
   Camera,
   Check,
   Crown,
+  LogOut,
   Palette,
   Pencil,
   Smartphone,
@@ -32,6 +33,7 @@ interface ProfileSectionProps {
   onOpenProPlans: () => void;
   onClearProjects: () => void;
   onBackToCreate: () => void;
+  onSignOut?: () => void;
 }
 
 export function DefaultProfileAvatar({ className = 'w-full h-full' }: { className?: string }) {
@@ -93,6 +95,7 @@ export function ProfileSection({
   onOpenProPlans,
   onClearProjects,
   onBackToCreate,
+  onSignOut,
 }: ProfileSectionProps) {
   const theme = MODE_THEMES[mode];
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -488,14 +491,26 @@ export function ProfileSection({
       {/* Compact Home-Screen Install Card */}
       <PWAInstallButton variant="card" />
 
-      <button
-        type="button"
-        onClick={onBackToCreate}
-        className="w-full min-h-[38px] rounded-full bg-[#0B0B0F] text-white text-[13px] font-medium flex items-center justify-center gap-2 hover:bg-black/85 active:scale-[0.98] transition-all shrink-0"
-      >
-        <Sparkles className="w-3.5 h-3.5" />
-        <span>Back to Create</span>
-      </button>
+      <div className="flex items-center gap-2 shrink-0">
+        {onSignOut && (
+          <button
+            type="button"
+            onClick={onSignOut}
+            className="min-h-[38px] px-4 rounded-full border border-black/15 text-[#0B0B0F] text-[13px] font-medium flex items-center justify-center gap-1.5 hover:bg-black/[0.03] active:scale-[0.98] transition-all shrink-0"
+          >
+            <LogOut className="w-3.5 h-3.5" />
+            <span>Sign Out</span>
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={onBackToCreate}
+          className="flex-1 min-h-[38px] rounded-full bg-[#0B0B0F] text-white text-[13px] font-medium flex items-center justify-center gap-2 hover:bg-black/85 active:scale-[0.98] transition-all shrink-0"
+        >
+          <Sparkles className="w-3.5 h-3.5" />
+          <span>Back to Create</span>
+        </button>
+      </div>
     </div>
   );
 }

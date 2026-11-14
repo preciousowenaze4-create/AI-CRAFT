@@ -14,6 +14,14 @@ export interface UserProfile {
   avatarDataUrl: string | null;
 }
 
+export interface AuthUser {
+  id: string;
+  email: string;
+  name: string;
+  avatarUrl: string | null;
+  provider: string;
+}
+
 export interface OpenRouterModel {
   id: string;
   name: string;

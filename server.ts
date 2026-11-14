@@ -1,7 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
+import { createClient, type User as SupabaseUser } from '@supabase/supabase-js';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -98,6 +101,168 @@ function getOpenRouterApiKey(): string {
   const apiKey = cleanEnvKey(process.env.API_KEY, ['MY_OPENROUTER_API_KEY']);
   if (apiKey.startsWith('sk-or-')) return apiKey;
   return '';
+}
+
+function getSupabaseConfig(): { url: string; anonKey: string; serviceRoleKey: string } {
+  const urlCandidates = [
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_PROJECT_URL,
+    process.env.NEXT_PUBLIC_SUPABASE_URL,
+    process.env.VITE_SUPABASE_URL,
+  ];
+  const anonCandidates = [
+    process.env.SUPABASE_ANON_KEY,
+    process.env.SUPABASE_PUBLISHABLE_KEY,
+    process.env.SUPABASE_KEY,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    process.env.VITE_SUPABASE_ANON_KEY,
+  ];
+  const serviceCandidates = [
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+    process.env.SUPABASE_SERVICE_KEY,
+  ];
+
+  let url = '';
+  for (const raw of urlCandidates) {
+    const cleaned = cleanEnvKey(raw, ['MY_SUPABASE_URL']);
+    if (cleaned && /^https?:\/\//i.test(cleaned)) {
+      url = cleaned.replace(/\/+$/, '');
+      break;
+    }
+  }
+
+  let anonKey = '';
+  for (const raw of anonCandidates) {
+    const cleaned = cleanEnvKey(raw, ['MY_SUPABASE_ANON_KEY']);
+    if (cleaned) {
+      anonKey = cleaned;
+      break;
+    }
+  }
+
+  let serviceRoleKey = '';
+  for (const raw of serviceCandidates) {
+    const cleaned = cleanEnvKey(raw, ['MY_SUPABASE_SERVICE_ROLE_KEY']);
+    if (cleaned) {
+      serviceRoleKey = cleaned;
+      break;
+    }
+  }
+
+  return {
+    url,
+    anonKey: anonKey || serviceRoleKey,
+    serviceRoleKey,
+  };
+}
+
+function createBackendSupabaseClient(useImplicitFlow = false) {
+  const { url, anonKey } = getSupabaseConfig();
+  if (!url || !anonKey) return null;
+  return createClient(url, anonKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false,
+      detectSessionInUrl: false,
+      ...(useImplicitFlow ? { flowType: 'implicit' as const } : {}),
+    },
+  });
+}
+
+function getAppBaseUrl(req?: express.Request): string {
+  const envUrl = cleanEnvKey(process.env.APP_URL, ['MY_APP_URL']);
+  if (envUrl) return envUrl.replace(/\/+$/, '');
+  if (req) {
+    const proto =
+      String(req.headers['x-forwarded-proto'] || '')
+        .split(',')[0]
+        ?.trim() ||
+      req.protocol ||
+      'http';
+    const host =
+      String(req.headers['x-forwarded-host'] || '')
+        .split(',')[0]
+        ?.trim() || req.get('host');
+    if (host) return `${proto}://${host}`.replace(/\/+$/, '');
+  }
+  return `http://localhost:${PORT}`;
+}
+
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!cookieHeader) return out;
+  for (const part of cookieHeader.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = part.slice(0, eqIdx).trim();
+    const val = part.slice(eqIdx + 1).trim();
+    if (!key) continue;
+    try {
+      out[key] = decodeURIComponent(val);
+    } catch {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+
+const SB_ACCESS_COOKIE = 'aicraft_sb_access';
+const SB_REFRESH_COOKIE = 'aicraft_sb_refresh';
+
+function setAuthCookies(
+  res: express.Response,
+  accessToken: string,
+  refreshToken?: string | null
+) {
+  const baseOpts: express.CookieOptions = {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    path: '/',
+    maxAge: 60 * 60 * 24 * 7 * 1000,
+  };
+  res.cookie(SB_ACCESS_COOKIE, accessToken, baseOpts);
+  if (refreshToken) {
+    res.cookie(SB_REFRESH_COOKIE, refreshToken, {
+      ...baseOpts,
+      maxAge: 60 * 60 * 24 * 30 * 1000,
+    });
+  }
+}
+
+function clearAuthCookies(res: express.Response) {
+  const clearOpts: express.CookieOptions = {
+    httpOnly: true,
+    secure: true,
+    sameSite: 'none',
+    path: '/',
+  };
+  res.clearCookie(SB_ACCESS_COOKIE, clearOpts);
+  res.clearCookie(SB_REFRESH_COOKIE, clearOpts);
+}
+
+function serializeSupabaseUser(user: SupabaseUser | null | undefined) {
+  if (!user) return null;
+  const meta = (user.user_metadata ?? {}) as Record<string, unknown>;
+  const appMeta = (user.app_metadata ?? {}) as Record<string, unknown>;
+  const rawName =
+    (typeof meta.full_name === 'string' && meta.full_name.trim()) ||
+    (typeof meta.name === 'string' && meta.name.trim()) ||
+    (typeof meta.user_name === 'string' && meta.user_name.trim()) ||
+    (user.email ? user.email.split('@')[0] : 'AI Craft User');
+  const avatarUrl =
+    (typeof meta.avatar_url === 'string' && meta.avatar_url.trim()) ||
+    (typeof meta.picture === 'string' && meta.picture.trim()) ||
+    null;
+
+  return {
+    id: user.id,
+    email: user.email || '',
+    name: rawName,
+    avatarUrl,
+    provider:
+      typeof appMeta.provider === 'string' ? appMeta.provider : 'email',
+  };
 }
 
 function isRestrictedHarnessModel(id: string): boolean {
@@ -1217,12 +1382,589 @@ async function startServer() {
   };
 
   app.get('/api/health', (_req, res) => {
+    const sbConfig = getSupabaseConfig();
     res.setHeader('Cache-Control', 'no-store');
     res.json({
       ok: true,
       openRouterConfigured: Boolean(getOpenRouterApiKey()),
       geminiConfigured: Boolean(getGeminiApiKey()),
+      supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
     });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Supabase Backend Authentication Proxy Routes
+  // ---------------------------------------------------------------------------
+  app.get('/api/auth/config', (req, res) => {
+    const sbConfig = getSupabaseConfig();
+    const callbackUrl = `${getAppBaseUrl(req)}/api/auth/callback`;
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      supabaseConfigured: Boolean(sbConfig.url && sbConfig.anonKey),
+      callbackUrl,
+    });
+  });
+
+  app.get('/api/auth/me', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const supabase = createBackendSupabaseClient();
+    if (!supabase) {
+      res.json({ configured: false, authenticated: false, user: null });
+      return;
+    }
+
+    const cookies = parseCookies(req.headers.cookie);
+    const authHeader = String(req.headers.authorization || '');
+    const bearerToken = /^bearer\s+/i.test(authHeader)
+      ? authHeader.replace(/^bearer\s+/i, '').trim()
+      : '';
+    const accessToken = bearerToken || cookies[SB_ACCESS_COOKIE] || '';
+    const refreshToken =
+      (typeof req.headers['x-refresh-token'] === 'string'
+        ? req.headers['x-refresh-token'].trim()
+        : '') ||
+      cookies[SB_REFRESH_COOKIE] ||
+      '';
+
+    if (!accessToken && !refreshToken) {
+      res.json({ configured: true, authenticated: false, user: null });
+      return;
+    }
+
+    try {
+      if (accessToken) {
+        const { data, error } = await supabase.auth.getUser(accessToken);
+        if (!error && data.user) {
+          res.json({
+            configured: true,
+            authenticated: true,
+            user: serializeSupabaseUser(data.user),
+            accessToken,
+            refreshToken: refreshToken || undefined,
+          });
+          return;
+        }
+      }
+
+      if (refreshToken) {
+        const { data, error } = await supabase.auth.refreshSession({
+          refresh_token: refreshToken,
+        });
+        if (!error && data.session && data.user) {
+          setAuthCookies(
+            res,
+            data.session.access_token,
+            data.session.refresh_token
+          );
+          res.json({
+            configured: true,
+            authenticated: true,
+            user: serializeSupabaseUser(data.user),
+            accessToken: data.session.access_token,
+            refreshToken: data.session.refresh_token,
+          });
+          return;
+        }
+      }
+
+      clearAuthCookies(res);
+      res.json({ configured: true, authenticated: false, user: null });
+    } catch {
+      res.json({ configured: true, authenticated: false, user: null });
+    }
+  });
+
+  app.post('/api/auth/signup', async (req, res) => {
+    const supabase = createBackendSupabaseClient(true);
+    if (!supabase) {
+      res.status(503).json({
+        error:
+          'Supabase backend secrets (SUPABASE_URL and SUPABASE_ANON_KEY) are not configured yet.',
+      });
+      return;
+    }
+
+    const body = req.body as { email?: string; password?: string } | undefined;
+    const email = typeof body?.email === 'string' ? body.email.trim() : '';
+    const password = typeof body?.password === 'string' ? body.password : '';
+
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'Please enter a valid email address.' });
+      return;
+    }
+    if (password.length < 6) {
+      res
+        .status(400)
+        .json({ error: 'Password must be at least 6 characters long.' });
+      return;
+    }
+
+    try {
+      const callbackUrl = `${getAppBaseUrl(req)}/api/auth/callback`;
+      const { data, error } = await supabase.auth.signUp({
+        email,
+        password,
+        options: {
+          emailRedirectTo: callbackUrl,
+        },
+      });
+
+      if (error) {
+        res.status(error.status || 400).json({ error: error.message });
+        return;
+      }
+
+      if (
+        data.user &&
+        Array.isArray(data.user.identities) &&
+        data.user.identities.length === 0
+      ) {
+        res.status(409).json({
+          error: 'An account with this email already exists. Try signing in instead.',
+        });
+        return;
+      }
+
+      if (data.session?.access_token) {
+        setAuthCookies(
+          res,
+          data.session.access_token,
+          data.session.refresh_token
+        );
+        res.json({
+          authenticated: true,
+          needsEmailConfirmation: false,
+          user: serializeSupabaseUser(data.user),
+          accessToken: data.session.access_token,
+          refreshToken: data.session.refresh_token,
+        });
+        return;
+      }
+
+      res.json({
+        authenticated: false,
+        needsEmailConfirmation: true,
+        user: serializeSupabaseUser(data.user),
+        message: 'Check your email to confirm your account, then sign in.',
+      });
+    } catch (err) {
+      res.status(500).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Failed to create account with Supabase.',
+      });
+    }
+  });
+
+  app.post('/api/auth/login', async (req, res) => {
+    const supabase = createBackendSupabaseClient();
+    if (!supabase) {
+      res.status(503).json({
+        error:
+          'Supabase backend secrets (SUPABASE_URL and SUPABASE_ANON_KEY) are not configured yet.',
+      });
+      return;
+    }
+
+    const body = req.body as { email?: string; password?: string } | undefined;
+    const email = typeof body?.email === 'string' ? body.email.trim() : '';
+    const password = typeof body?.password === 'string' ? body.password : '';
+
+    if (!email || !password) {
+      res
+        .status(400)
+        .json({ error: 'Please enter both your email and password.' });
+      return;
+    }
+
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email,
+        password,
+      });
+
+      if (error || !data.session || !data.user) {
+        res.status(error?.status || 401).json({
+          error: error?.message || 'Invalid email or password.',
+        });
+        return;
+      }
+
+      setAuthCookies(res, data.session.access_token, data.session.refresh_token);
+      res.json({
+        authenticated: true,
+        user: serializeSupabaseUser(data.user),
+        accessToken: data.session.access_token,
+        refreshToken: data.session.refresh_token,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Unable to sign in with Supabase right now.',
+      });
+    }
+  });
+
+  app.post('/api/auth/forgot-password', async (req, res) => {
+    const supabase = createBackendSupabaseClient(true);
+    if (!supabase) {
+      res.status(503).json({
+        error:
+          'Supabase backend secrets (SUPABASE_URL and SUPABASE_ANON_KEY) are not configured yet.',
+      });
+      return;
+    }
+
+    const body = req.body as { email?: string } | undefined;
+    const email = typeof body?.email === 'string' ? body.email.trim() : '';
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      res.status(400).json({ error: 'Please enter a valid email address.' });
+      return;
+    }
+
+    try {
+      const callbackUrl = `${getAppBaseUrl(req)}/api/auth/callback`;
+      const { error } = await supabase.auth.resetPasswordForEmail(email, {
+        redirectTo: callbackUrl,
+      });
+
+      if (error) {
+        res.status(error.status || 400).json({ error: error.message });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        message: 'Password reset email sent. Check your inbox for the reset link.',
+      });
+    } catch (err) {
+      res.status(500).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Failed to send password reset email.',
+      });
+    }
+  });
+
+  app.post('/api/auth/update-password', async (req, res) => {
+    const supabase = createBackendSupabaseClient();
+    if (!supabase) {
+      res.status(503).json({
+        error:
+          'Supabase backend secrets (SUPABASE_URL and SUPABASE_ANON_KEY) are not configured yet.',
+      });
+      return;
+    }
+
+    const body = req.body as
+      | { access_token?: string; refresh_token?: string; password?: string }
+      | undefined;
+    const accessToken =
+      typeof body?.access_token === 'string' ? body.access_token.trim() : '';
+    const refreshToken =
+      typeof body?.refresh_token === 'string' ? body.refresh_token.trim() : '';
+    const password = typeof body?.password === 'string' ? body.password : '';
+
+    if (!accessToken || !refreshToken) {
+      res.status(400).json({ error: 'Invalid or expired reset session.' });
+      return;
+    }
+    if (password.length < 6) {
+      res
+        .status(400)
+        .json({ error: 'New password must be at least 6 characters long.' });
+      return;
+    }
+
+    try {
+      const { error: setErr } = await supabase.auth.setSession({
+        access_token: accessToken,
+        refresh_token: refreshToken,
+      });
+      if (setErr) {
+        res.status(401).json({ error: setErr.message });
+        return;
+      }
+
+      const { data, error } = await supabase.auth.updateUser({ password });
+      if (error || !data.user) {
+        res.status(error?.status || 400).json({
+          error: error?.message || 'Unable to update password.',
+        });
+        return;
+      }
+
+      setAuthCookies(res, accessToken, refreshToken);
+      res.json({
+        ok: true,
+        user: serializeSupabaseUser(data.user),
+        accessToken,
+        refreshToken,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error:
+          err instanceof Error ? err.message : 'Unable to update password.',
+      });
+    }
+  });
+
+  app.get('/api/auth/oauth/url', async (req, res) => {
+    const supabase = createBackendSupabaseClient(true);
+    if (!supabase) {
+      res.status(503).json({
+        error:
+          'Supabase backend secrets (SUPABASE_URL and SUPABASE_ANON_KEY) are not configured yet.',
+      });
+      return;
+    }
+
+    const providerParam = String(req.query.provider || '').toLowerCase();
+    if (
+      providerParam !== 'google' &&
+      providerParam !== 'apple' &&
+      providerParam !== 'github'
+    ) {
+      res.status(400).json({ error: 'Unsupported OAuth provider.' });
+      return;
+    }
+
+    try {
+      const callbackUrl = `${getAppBaseUrl(req)}/api/auth/callback`;
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: providerParam,
+        options: {
+          redirectTo: callbackUrl,
+          skipBrowserRedirect: true,
+          ...(providerParam === 'google'
+            ? {
+                queryParams: {
+                  access_type: 'offline',
+                  prompt: 'select_account',
+                },
+              }
+            : {}),
+        },
+      });
+
+      if (error || !data?.url) {
+        res.status(400).json({
+          error: error?.message || `Failed to create ${providerParam} login URL.`,
+        });
+        return;
+      }
+
+      res.json({ url: data.url });
+    } catch (err) {
+      res.status(500).json({
+        error:
+          err instanceof Error
+            ? err.message
+            : 'Unable to initialize OAuth sign in.',
+      });
+    }
+  });
+
+  app.post('/api/auth/session', async (req, res) => {
+    const supabase = createBackendSupabaseClient();
+    if (!supabase) {
+      res.status(503).json({
+        error: 'Supabase backend secrets are not configured yet.',
+      });
+      return;
+    }
+
+    const body = req.body as
+      | { access_token?: string; refresh_token?: string }
+      | undefined;
+    const accessToken =
+      typeof body?.access_token === 'string' ? body.access_token.trim() : '';
+    const refreshToken =
+      typeof body?.refresh_token === 'string' ? body.refresh_token.trim() : '';
+
+    if (!accessToken) {
+      res.status(400).json({ error: 'Missing Supabase access token.' });
+      return;
+    }
+
+    try {
+      const { data, error } = await supabase.auth.getUser(accessToken);
+      if (error || !data.user) {
+        res.status(401).json({
+          error: error?.message || 'Invalid Supabase session token.',
+        });
+        return;
+      }
+
+      setAuthCookies(res, accessToken, refreshToken || null);
+      res.json({
+        authenticated: true,
+        user: serializeSupabaseUser(data.user),
+        accessToken,
+        refreshToken: refreshToken || undefined,
+      });
+    } catch (err) {
+      res.status(500).json({
+        error:
+          err instanceof Error ? err.message : 'Failed to verify session.',
+      });
+    }
+  });
+
+  app.post('/api/auth/logout', async (req, res) => {
+    clearAuthCookies(res);
+    const supabase = createBackendSupabaseClient();
+    const authHeader = String(req.headers.authorization || '');
+    const token = /^bearer\s+/i.test(authHeader)
+      ? authHeader.replace(/^bearer\s+/i, '').trim()
+      : '';
+    if (supabase && token) {
+      try {
+        await supabase.auth.getUser(token);
+      } catch {
+        // ignore cleanup failure
+      }
+    }
+    res.json({ ok: true });
+  });
+
+  app.get(['/api/auth/callback', '/api/auth/callback/'], (_req, res) => {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(`<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Craft — Signing In</title>
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: #ffffff;
+        color: #0b0b0f;
+        padding: 24px;
+        text-align: center;
+      }
+      .card { max-width: 340px; }
+      h1 { font-size: 18px; margin: 0 0 8px; font-weight: 700; }
+      p { font-size: 14px; color: #52525b; margin: 0; line-height: 1.45; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h1 id="title">Completing sign-in…</h1>
+      <p id="status">Returning you to AI Craft.</p>
+    </div>
+    <script>
+      (async function () {
+        var titleEl = document.getElementById('title');
+        var statusEl = document.getElementById('status');
+        try {
+          var hashParams = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+          var queryParams = new URLSearchParams(window.location.search || '');
+          var errMsg =
+            hashParams.get('error_description') ||
+            hashParams.get('error') ||
+            queryParams.get('error_description') ||
+            queryParams.get('error');
+
+          if (errMsg) {
+            titleEl.textContent = 'Sign-in could not complete';
+            statusEl.textContent = errMsg;
+            if (window.opener) {
+              window.opener.postMessage({ type: 'OAUTH_AUTH_ERROR', message: errMsg }, '*');
+              setTimeout(function () { window.close(); }, 1600);
+            }
+            return;
+          }
+
+          var accessToken = hashParams.get('access_token') || '';
+          var refreshToken = hashParams.get('refresh_token') || '';
+          var flowType = hashParams.get('type') || queryParams.get('type') || '';
+
+          if (flowType === 'recovery' && accessToken) {
+            try {
+              localStorage.setItem(
+                'aicraft_sb_recovery_v1',
+                JSON.stringify({ accessToken: accessToken, refreshToken: refreshToken })
+              );
+            } catch (e) {}
+            if (window.opener) {
+              window.opener.postMessage(
+                { type: 'SUPABASE_AUTH_RECOVERY', accessToken: accessToken, refreshToken: refreshToken },
+                '*'
+              );
+              window.close();
+            } else {
+              window.location.replace('/?auth_recovery=1');
+            }
+            return;
+          }
+
+          if (accessToken) {
+            var res = await fetch('/api/auth/session', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                access_token: accessToken,
+                refresh_token: refreshToken
+              })
+            });
+            var payload = await res.json();
+            if (!res.ok || !payload.authenticated) {
+              throw new Error(payload.error || 'Could not validate sign-in session.');
+            }
+            try {
+              localStorage.setItem(
+                'aicraft_sb_session_v1',
+                JSON.stringify({
+                  accessToken: payload.accessToken || accessToken,
+                  refreshToken: payload.refreshToken || refreshToken
+                })
+              );
+            } catch (e) {}
+
+            if (window.opener) {
+              window.opener.postMessage(
+                {
+                  type: 'OAUTH_AUTH_SUCCESS',
+                  user: payload.user,
+                  accessToken: payload.accessToken || accessToken,
+                  refreshToken: payload.refreshToken || refreshToken
+                },
+                '*'
+              );
+              window.close();
+            } else {
+              window.location.replace('/');
+            }
+            return;
+          }
+
+          titleEl.textContent = 'Authorization code received';
+          statusEl.textContent =
+            'Please enable Implicit OAuth flow or use Email sign-in in your Supabase project.';
+        } catch (err) {
+          var msg = err && err.message ? err.message : 'Authentication failed.';
+          titleEl.textContent = 'Sign-in error';
+          statusEl.textContent = msg;
+          if (window.opener) {
+            window.opener.postMessage({ type: 'OAUTH_AUTH_ERROR', message: msg }, '*');
+          }
+        }
+      })();
+    </script>
+  </body>
+</html>`);
   });
 
   app.get('/api/craft/jobs/:jobId', (req, res) => {
@@ -2257,6 +2999,35 @@ async function startServer() {
         message: errorMessage,
       });
     }
+  });
+
+  // Serve 3D head GLB pre-gzipped with immutable browser caching for instant load
+  const glbCandidates = [
+    path.join(__dirname, 'public', 'psichedelic_abstract_geometry_loop_animation.glb'),
+    path.join(__dirname, 'dist', 'psichedelic_abstract_geometry_loop_animation.glb'),
+    path.join(__dirname, 'psichedelic_abstract_geometry_loop_animation.glb'),
+  ];
+  const glbPath = glbCandidates.find((p) => fs.existsSync(p));
+  const glbRaw = glbPath ? fs.readFileSync(glbPath) : null;
+  const glbGzip = glbRaw ? zlib.gzipSync(glbRaw, { level: 6 }) : null;
+
+  app.get('/psichedelic_abstract_geometry_loop_animation.glb', (req, res) => {
+    if (!glbRaw) {
+      res.status(404).end();
+      return;
+    }
+    res.setHeader('Content-Type', 'model/gltf-binary');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.setHeader('Vary', 'Accept-Encoding');
+    const acceptEnc = String(req.headers['accept-encoding'] || '');
+    if (glbGzip && acceptEnc.includes('gzip')) {
+      res.setHeader('Content-Encoding', 'gzip');
+      res.setHeader('Content-Length', String(glbGzip.length));
+      res.status(200).send(glbGzip);
+      return;
+    }
+    res.setHeader('Content-Length', String(glbRaw.length));
+    res.status(200).send(glbRaw);
   });
 
   if (!IS_PROD) {
